@@ -898,7 +898,7 @@ tests =
                          , "rundoc-block"
                          ]
                params = [ ("rundoc-language", "emacs-lisp")
-                        , ("rundoc-exports", "code")
+                        , ("rundoc-exports", "both")
                         ]
                code' = unlines [ "(progn (message \"Hello, World!\")"
                                , "       (+ 23 42))" ]
