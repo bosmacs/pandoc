@@ -364,14 +364,12 @@ codeBlock blkProp = do
   content        <- rawBlockContent blkProp
   includeCode    <- exportsCode kv
   includeResults <- exportsResults kv
-  _              <- if not includeResults
-                       then try $ string "\n\n#+RESULTS:\n" *> (unlines <$> many1 exampleLine)
-                       else try $ string "\n"
-  --traceShowM nextBlock
+  resultsContent <- option mempty (try $ blanklines *> string "#+RESULTS:" *> blankline *> (unlines <$> many1 exampleLine))
+  --traceShowM resultsBlock
   let codeBlck   = B.codeBlockWith ( id', classes, kv ) content
-  if includeCode
-     then maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
-     else pure mempty
+  labelledBlck <- maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
+  let resultBlck = pure $ exampleCode resultsContent
+  return $ (if includeCode then labelledBlck else mempty) <> (if includeResults then resultBlck else mempty)
  where
    labelDiv blk value =
        B.divWith nullAttr <$> (mappend <$> labelledBlock value
