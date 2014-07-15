@@ -369,8 +369,10 @@ codeBlock blkProp = do
 --  traceShowM includeCode
 --  traceShowM includeResults
 --  traceShowM nextBlock
-  let codeBlck  = B.codeBlockWith ( id', classes, kv ) (if includeCode then content else "") -- this is cheating
-  maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
+  let codeBlck  = B.codeBlockWith ( id', classes, kv ) content
+  if includeCode
+     then maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
+     else pure mempty
  where
    labelDiv blk value =
        B.divWith nullAttr <$> (mappend <$> labelledBlock value
