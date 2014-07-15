@@ -55,6 +55,14 @@ import qualified Data.Map as M
 import           Data.Maybe (fromMaybe, isJust)
 import           Data.Monoid (Monoid, mconcat, mempty, mappend)
 import           Network.HTTP (urlEncode)
+import           Debug.Trace (trace)
+
+-- temporarilly borrowed from base 4.7.0.0
+traceM :: (Monad m) => String -> m ()
+traceM string = trace string $ return ()
+
+traceShowM :: (Show a, Monad m) => a -> m ()
+traceShowM = traceM . show
 
 -- | Parse org-mode string and return a Pandoc document.
 readOrg :: ReaderOptions -- ^ Reader options
@@ -341,13 +349,27 @@ verseBlock blkProp = try $ do
   fmap B.para . mconcat . intersperse (pure B.linebreak)
     <$> mapM (parseFromString parseInlines) (lines content)
 
+
+exportsCode :: (Monad m) => [(String, String)] -> m (Bool)
+exportsCode attrs = return $ not (("rundoc-exports", "none") `elem` attrs || ("rundoc-exports", "results") `elem` attrs)
+
+exportsResults :: (Monad m) => [(String, String)] -> m (Bool)
+exportsResults attrs = return $ ("rundoc-exports", "results") `elem` attrs || ("rundoc-exports", "both") `elem` attrs
+
 codeBlock :: BlockProperties -> OrgParser (F Blocks)
 codeBlock blkProp = do
   skipSpaces
   (classes, kv) <- codeHeaderArgs <|> (mempty <$ ignHeaders)
   id'           <- fromMaybe "" <$> lookupBlockAttribute "name"
   content       <- rawBlockContent blkProp
-  let codeBlck  = B.codeBlockWith ( id', classes, kv ) content
+  includeCode   <- exportsCode kv
+  includeResults <- exportsResults kv
+--  nextBlock     <- optionMaybe (lookAhead (skipSpaces *> string "\n\n#+RESULTS:\n" *> skipSpaces *> (try $ many1 exampleLine)))
+--  nextBlock <- optionMaybe (lookAhead (skipSpaces *> metaLineStart))
+--  traceShowM includeCode
+--  traceShowM includeResults
+--  traceShowM nextBlock
+  let codeBlck  = B.codeBlockWith ( id', classes, kv ) (if includeCode then content else "") -- this is cheating
   maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
  where
    labelDiv blk value =
