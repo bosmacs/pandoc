@@ -359,17 +359,16 @@ exportsResults attrs = return $ ("rundoc-exports", "results") `elem` attrs || ("
 codeBlock :: BlockProperties -> OrgParser (F Blocks)
 codeBlock blkProp = do
   skipSpaces
-  (classes, kv) <- codeHeaderArgs <|> (mempty <$ ignHeaders)
-  id'           <- fromMaybe "" <$> lookupBlockAttribute "name"
-  content       <- rawBlockContent blkProp
-  includeCode   <- exportsCode kv
+  (classes, kv)  <- codeHeaderArgs <|> (mempty <$ ignHeaders)
+  id'            <- fromMaybe "" <$> lookupBlockAttribute "name"
+  content        <- rawBlockContent blkProp
+  includeCode    <- exportsCode kv
   includeResults <- exportsResults kv
---  nextBlock     <- optionMaybe (lookAhead (skipSpaces *> string "\n\n#+RESULTS:\n" *> skipSpaces *> (try $ many1 exampleLine)))
---  nextBlock <- optionMaybe (lookAhead (skipSpaces *> metaLineStart))
---  traceShowM includeCode
---  traceShowM includeResults
---  traceShowM nextBlock
-  let codeBlck  = B.codeBlockWith ( id', classes, kv ) content
+  _              <- if not includeResults
+                       then try $ string "\n\n#+RESULTS:\n" *> (unlines <$> many1 exampleLine)
+                       else try $ string "\n"
+  --traceShowM nextBlock
+  let codeBlck   = B.codeBlockWith ( id', classes, kv ) content
   if includeCode
      then maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
      else pure mempty
