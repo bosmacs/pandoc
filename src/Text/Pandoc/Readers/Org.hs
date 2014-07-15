@@ -55,14 +55,6 @@ import qualified Data.Map as M
 import           Data.Maybe (fromMaybe, isJust)
 import           Data.Monoid (Monoid, mconcat, mempty, mappend)
 import           Network.HTTP (urlEncode)
-import           Debug.Trace (trace)
-
--- temporarilly borrowed from base 4.7.0.0
-traceM :: (Monad m) => String -> m ()
-traceM string = trace string $ return ()
-
-traceShowM :: (Show a, Monad m) => a -> m ()
-traceShowM = traceM . show
 
 -- | Parse org-mode string and return a Pandoc document.
 readOrg :: ReaderOptions -- ^ Reader options
@@ -350,25 +342,24 @@ verseBlock blkProp = try $ do
     <$> mapM (parseFromString parseInlines) (lines content)
 
 
-exportsCode :: (Monad m) => [(String, String)] -> m (Bool)
-exportsCode attrs = return $ not (("rundoc-exports", "none") `elem` attrs || ("rundoc-exports", "results") `elem` attrs)
+exportsCode :: [(String, String)] -> Bool
+exportsCode attrs = not (("rundoc-exports", "none") `elem` attrs || ("rundoc-exports", "results") `elem` attrs)
 
-exportsResults :: (Monad m) => [(String, String)] -> m (Bool)
-exportsResults attrs = return $ ("rundoc-exports", "results") `elem` attrs || ("rundoc-exports", "both") `elem` attrs
+exportsResults :: [(String, String)] -> Bool
+exportsResults attrs = ("rundoc-exports", "results") `elem` attrs || ("rundoc-exports", "both") `elem` attrs
 
 codeBlock :: BlockProperties -> OrgParser (F Blocks)
 codeBlock blkProp = do
   skipSpaces
-  (classes, kv)  <- codeHeaderArgs <|> (mempty <$ ignHeaders)
-  id'            <- fromMaybe "" <$> lookupBlockAttribute "name"
-  content        <- rawBlockContent blkProp
-  includeCode    <- exportsCode kv
-  includeResults <- exportsResults kv
-  resultsContent <- option mempty (try $ blanklines *> string "#+RESULTS:" *> blankline *> (unlines <$> many1 exampleLine))
-  --traceShowM resultsBlock
-  let codeBlck   = B.codeBlockWith ( id', classes, kv ) content
-  labelledBlck <- maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
-  let resultBlck = pure $ exampleCode resultsContent
+  (classes, kv)     <- codeHeaderArgs <|> (mempty <$ ignHeaders)
+  id'               <- fromMaybe "" <$> lookupBlockAttribute "name"
+  content           <- rawBlockContent blkProp
+  let includeCode    = exportsCode kv
+  let includeResults = exportsResults kv
+  resultsContent    <- option mempty (try $ blanklines *> string "#+RESULTS:" *> blankline *> (unlines <$> many1 exampleLine))
+  let codeBlck       = B.codeBlockWith ( id', classes, kv ) content
+  labelledBlck      <- maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
+  let resultBlck     = pure $ exampleCode resultsContent
   return $ (if includeCode then labelledBlck else mempty) <> (if includeResults then resultBlck else mempty)
  where
    labelDiv blk value =
