@@ -356,10 +356,10 @@ codeBlock blkProp = do
   content           <- rawBlockContent blkProp
   let includeCode    = exportsCode kv
   let includeResults = exportsResults kv
-  resultsContent    <- option mempty (try $ blanklines *> string "#+RESULTS:" *> blankline *> (unlines <$> many1 exampleLine))
+  resultsContent    <- optionMaybe (try $ blanklines *> stringAnyCase "#+RESULTS:" *> blankline *> (unlines <$> many1 exampleLine))
   let codeBlck       = B.codeBlockWith ( id', classes, kv ) content
   labelledBlck      <- maybe (pure codeBlck) (labelDiv codeBlck) <$> lookupInlinesAttr "caption"
-  let resultBlck     = pure $ exampleCode resultsContent
+  let resultBlck     = pure $ maybe mempty (exampleCode) resultsContent
   return $ (if includeCode then labelledBlck else mempty) <> (if includeResults then resultBlck else mempty)
  where
    labelDiv blk value =
