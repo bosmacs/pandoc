@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable, CPP, MultiParamTypeClasses,
-    FlexibleContexts, ScopedTypeVariables #-}
+    FlexibleContexts, ScopedTypeVariables, PatternGuards,
+    ViewPatterns #-}
 {-
 Copyright (C) 2006-2014 John MacFarlane <jgm@berkeley.edu>
 
@@ -59,6 +60,7 @@ module Text.Pandoc.Shared (
                      normalizeBlocks,
                      removeFormatting,
                      stringify,
+                     capitalize,
                      compactify,
                      compactify',
                      compactify'DL,
@@ -77,16 +79,21 @@ module Text.Pandoc.Shared (
                      readDataFile,
                      readDataFileUTF8,
                      fetchItem,
+                     fetchItem',
                      openURL,
+                     collapseFilePath,
                      -- * Error handling
                      err,
                      warn,
                      -- * Safe read
-                     safeRead
+                     safeRead,
+                     -- * Temp directory
+                     withTempDir
                     ) where
 
 import Text.Pandoc.Definition
 import Text.Pandoc.Walk
+import Text.Pandoc.MediaBag (MediaBag, lookupMedia)
 import Text.Pandoc.Builder (Inlines, Blocks, ToMetaValue(..))
 import qualified Text.Pandoc.Builder as B
 import qualified Text.Pandoc.UTF8 as UTF8
@@ -94,14 +101,15 @@ import System.Environment (getProgName)
 import System.Exit (exitWith, ExitCode(..))
 import Data.Char ( toLower, isLower, isUpper, isAlpha,
                    isLetter, isDigit, isSpace )
-import Data.List ( find, isPrefixOf, intercalate )
+import Data.List ( find, stripPrefix, intercalate )
 import qualified Data.Map as M
 import Network.URI ( escapeURIString, isURI, nonStrictRelativeTo,
-                     unEscapeString, parseURIReference )
+                     unEscapeString, parseURIReference, isAllowedInURI )
 import qualified Data.Set as Set
 import System.Directory
-import Text.Pandoc.MIME (getMimeType)
-import System.FilePath ( (</>), takeExtension, dropExtension )
+import System.FilePath (joinPath, splitDirectories, pathSeparator, isPathSeparator)
+import Text.Pandoc.MIME (MimeType, getMimeType)
+import System.FilePath ( (</>), takeExtension, dropExtension)
 import Data.Generics (Typeable, Data)
 import qualified Control.Monad.State as S
 import qualified Control.Exception as E
@@ -110,6 +118,7 @@ import Text.Pandoc.Pretty (charWidth)
 import System.Locale (defaultTimeLocale)
 import Data.Time
 import System.IO (stderr)
+import System.IO.Temp
 import Text.HTML.TagSoup (renderTagsOptions, RenderOptions(..), Tag(..),
          renderOptions)
 import qualified Data.ByteString as BS
@@ -117,15 +126,15 @@ import qualified Data.ByteString.Char8 as B8
 import Text.Pandoc.Compat.Monoid
 import Data.ByteString.Base64 (decodeLenient)
 import Data.Sequence (ViewR(..), ViewL(..), viewl, viewr)
+import qualified Data.Text as T (toUpper, pack, unpack)
+import Data.ByteString.Lazy (toChunks)
 
 #ifdef EMBED_DATA_FILES
 import Text.Pandoc.Data (dataFiles)
-import System.FilePath ( joinPath, splitDirectories )
 #else
 import Paths_pandoc (getDataFileName)
 #endif
 #ifdef HTTP_CLIENT
-import Data.ByteString.Lazy (toChunks)
 import Network.HTTP.Client (httpLbs, parseUrl, withManager,
                             responseBody, responseHeaders,
                             Request(port,host))
@@ -176,9 +185,9 @@ substitute :: (Eq a) => [a] -> [a] -> [a] -> [a]
 substitute _ _ [] = []
 substitute [] _ xs = xs
 substitute target replacement lst@(x:xs) =
-    if target `isPrefixOf` lst
-       then replacement ++ substitute target replacement (drop (length target) lst)
-       else x : substitute target replacement xs
+    case stripPrefix target lst of
+      Just lst' -> replacement ++ substitute target replacement lst'
+      Nothing   -> x : substitute target replacement xs
 
 ordNub :: (Ord a) => [a] -> [a]
 ordNub l = go Set.empty l
@@ -522,6 +531,17 @@ stringify = query go . walk deNote
         deNote (Note _) = Str ""
         deNote x = x
 
+-- | Bring all regular text in a pandoc structure to uppercase.
+--
+-- This function correctly handles cases where a lowercase character doesn't
+-- match to a single uppercase character – e.g. “Straße” would be converted
+-- to “STRASSE”, not “STRAßE”.
+capitalize :: Walkable Inline a => a -> a
+capitalize = walk go
+  where go :: Inline -> Inline
+        go (Str s) = Str (T.unpack $ T.toUpper $ T.pack s)
+        go x       = x
+
 -- | Change final list item from @Para@ to @Plain@ if the list contains
 -- no other @Para@ blocks.
 compactify :: [[Block]]  -- ^ List of list items (each a list of blocks)
@@ -553,20 +573,22 @@ compactify' items =
                             _   -> items
            _      -> items
 
--- | Like @compactify'@, but akts on items of definition lists.
+-- | Like @compactify'@, but acts on items of definition lists.
 compactify'DL :: [(Inlines, [Blocks])] -> [(Inlines, [Blocks])]
 compactify'DL items =
   let defs = concatMap snd items
-      defBlocks = reverse $ concatMap B.toList defs
-  in  case defBlocks of
-           (Para x:_) -> if not $ any isPara (drop 1 defBlocks)
-                            then let (t,ds) = last items
-                                     lastDef = B.toList $ last ds
-                                     ds' = init ds ++
-                                          [B.fromList $ init lastDef ++ [Plain x]]
-                                  in init items ++ [(t, ds')]
-                            else items
-           _          -> items
+  in  case reverse (concatMap B.toList defs) of
+           (Para x:xs)
+             | not (any isPara xs) ->
+                   let (t,ds) = last items
+                       lastDef = B.toList $ last ds
+                       ds' = init ds ++
+                             if null lastDef
+                                then [B.fromList lastDef]
+                                else [B.fromList $ init lastDef ++ [Plain x]]
+                    in init items ++ [(t, ds')]
+             | otherwise           -> items
+           _                       -> items
 
 isPara :: Block -> Bool
 isPara (Para _) = True
@@ -758,29 +780,40 @@ readDataFileUTF8 userDir fname =
 -- | Fetch an image or other item from the local filesystem or the net.
 -- Returns raw content and maybe mime type.
 fetchItem :: Maybe String -> String
-          -> IO (Either E.SomeException (BS.ByteString, Maybe String))
-fetchItem sourceURL s
-  | isURI s         = openURL s
-  | otherwise       =
-      case sourceURL >>= parseURIReference of
-           Just u  -> case parseURIReference s of
-                           Just s' -> openURL $ show $
-                                        s' `nonStrictRelativeTo` u
-                           Nothing -> openURL $ show u ++ "/" ++ s
-           Nothing -> E.try readLocalFile
+          -> IO (Either E.SomeException (BS.ByteString, Maybe MimeType))
+fetchItem sourceURL s =
+  case (sourceURL >>= parseURIReference . ensureEscaped, ensureEscaped s) of
+       (_, s') | isURI s'  -> openURL s'
+       (Just u, s') -> -- try fetching from relative path at source
+          case parseURIReference s' of
+               Just u' -> openURL $ show $ u' `nonStrictRelativeTo` u
+               Nothing -> openURL s' -- will throw error
+       (Nothing, _) -> E.try readLocalFile -- get from local file system
   where readLocalFile = do
-          let mime = case takeExtension s of
-                          ".gz" -> getMimeType $ dropExtension s
-                          x     -> getMimeType x
-          cont <- BS.readFile s
+          cont <- BS.readFile fp
           return (cont, mime)
+        dropFragmentAndQuery = takeWhile (\c -> c /= '?' && c /= '#')
+        fp = unEscapeString $ dropFragmentAndQuery s
+        mime = case takeExtension fp of
+                    ".gz" -> getMimeType $ dropExtension fp
+                    x     -> getMimeType x
+        ensureEscaped x@(_:':':'\\':_) = x -- likely windows path
+        ensureEscaped x = escapeURIString isAllowedInURI x
+
+-- | Like 'fetchItem', but also looks for items in a 'MediaBag'.
+fetchItem' :: MediaBag -> Maybe String -> String
+           -> IO (Either E.SomeException (BS.ByteString, Maybe MimeType))
+fetchItem' media sourceURL s = do
+  case lookupMedia s media of
+       Nothing -> fetchItem sourceURL s
+       Just (mime, bs) -> return $ Right (BS.concat $ toChunks bs, Just mime)
 
 -- | Read from a URL and return raw data and maybe mime type.
-openURL :: String -> IO (Either E.SomeException (BS.ByteString, Maybe String))
+openURL :: String -> IO (Either E.SomeException (BS.ByteString, Maybe MimeType))
 openURL u
-  | "data:" `isPrefixOf` u =
-    let mime     = takeWhile (/=',') $ drop 5 u
-        contents = B8.pack $ unEscapeString $ drop 1 $ dropWhile (/=',') u
+  | Just u' <- stripPrefix "data:" u =
+    let mime     = takeWhile (/=',') u'
+        contents = B8.pack $ unEscapeString $ drop 1 $ dropWhile (/=',') u'
     in  return $ Right (decodeLenient contents, Just mime)
 #ifdef HTTP_CLIENT
   | otherwise = withSocketsDo $ E.try $ do
@@ -824,6 +857,30 @@ warn msg = do
   name <- getProgName
   UTF8.hPutStrLn stderr $ name ++ ": " ++ msg
 
+-- | Remove intermediate "." and ".." directories from a path.
+--
+-- > collapseFilePath "./foo" == "foo"
+-- > collapseFilePath "/bar/../baz" == "/baz"
+-- > collapseFilePath "/../baz" == "/../baz"
+-- > collapseFilePath "parent/foo/baz/../bar" ==  "parent/foo/bar"
+-- > collapseFilePath "parent/foo/baz/../../bar" ==  "parent/bar"
+-- > collapseFilePath "parent/foo/.." ==  "parent"
+-- > collapseFilePath "/parent/foo/../../bar" ==  "/bar"
+collapseFilePath :: FilePath -> FilePath
+collapseFilePath = joinPath . reverse . foldl go [] . splitDirectories
+  where
+    go rs "." = rs
+    go r@(p:rs) ".." = case p of
+                            ".." -> ("..":r)
+                            (checkPathSeperator -> Just True) -> ("..":r)
+                            _ -> rs
+    go _ (checkPathSeperator -> Just True) = [[pathSeparator]]
+    go rs x = x:rs
+    isSingleton [] = Nothing
+    isSingleton [x] = Just x
+    isSingleton _ = Nothing
+    checkPathSeperator = fmap isPathSeparator . isSingleton
+
 --
 -- Safe read
 --
@@ -833,3 +890,15 @@ safeRead s = case reads s of
                   (d,x):_
                     | all isSpace x -> return d
                   _                 -> fail $ "Could not read `" ++ s ++ "'"
+
+--
+-- Temp directory
+--
+
+withTempDir :: String -> (FilePath -> IO a) -> IO a
+withTempDir =
+#ifdef _WINDOWS
+  withTempDirectory "."
+#else
+  withSystemTempDirectory
+#endif

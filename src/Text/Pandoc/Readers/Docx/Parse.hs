@@ -1,4 +1,4 @@
-{-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE PatternGuards, ViewPatterns #-}
 
 {-
 Copyright (C) 2014 Jesse Rosenthal <jrosenthal@jhu.edu>
@@ -36,15 +36,6 @@ module Text.Pandoc.Readers.Docx.Parse ( Docx(..)
                                       , BodyPart(..)
                                       , TblLook(..)
                                       , ParPart(..)
-                                      , OMath(..)
-                                      , OMathElem(..)
-                                      , Base(..)
-                                      , TopBottom(..)
-                                      , AccentStyle(..)
-                                      , BarStyle(..)
-                                      , NAryStyle(..)
-                                      , DelimStyle(..)
-                                      , GroupStyle(..)
                                       , Run(..)
                                       , RunElem(..)
                                       , Notes
@@ -52,13 +43,13 @@ module Text.Pandoc.Readers.Docx.Parse ( Docx(..)
                                       , Relationship
                                       , Media
                                       , RunStyle(..)
+                                      , VertAlign(..)
                                       , ParIndentation(..)
                                       , ParagraphStyle(..)
                                       , Row(..)
                                       , Cell(..)
                                       , archiveToDocx
                                       ) where
-
 import Codec.Archive.Zip
 import Text.XML.Light
 import Data.Maybe
@@ -68,13 +59,20 @@ import Data.Bits ((.|.))
 import qualified Data.ByteString.Lazy as B
 import qualified Text.Pandoc.UTF8 as UTF8
 import Control.Monad.Reader
+import Control.Applicative ((<$>), (<|>))
 import qualified Data.Map as M
 import Text.Pandoc.Compat.Except
+import Text.TeXMath.Readers.OMML (readOMML)
+import Text.Pandoc.Readers.Docx.Fonts (getUnicode, Font(..))
+import Text.TeXMath (Exp)
+import Data.Char (readLitChar, ord, chr)
 
 data ReaderEnv = ReaderEnv { envNotes         :: Notes
                            , envNumbering     :: Numbering
                            , envRelationships :: [Relationship]
                            , envMedia         :: Media
+                           , envFont          :: Maybe Font
+                           , envCharStyles    :: CharStyleMap
                            }
                deriving Show
 
@@ -93,13 +91,21 @@ maybeToD :: Maybe a -> D a
 maybeToD (Just a) = return a
 maybeToD Nothing = throwError DocxError
 
-mapD :: (a -> D b) -> [a] -> D [b]
-mapD _ [] = return []
-mapD f (x:xs) = do
-  y <- (f x >>= (\z -> return [z])) `catchError` (\_ -> return [])
-  ys <- mapD f xs
-  return $ y ++ ys
+eitherToD :: Either a b -> D b
+eitherToD (Right b) = return b
+eitherToD (Left _)  = throwError DocxError
 
+concatMapM        :: (Monad m) => (a -> m [b]) -> [a] -> m [b]
+concatMapM f xs   =  liftM concat (mapM f xs)
+
+
+-- This is similar to `mapMaybe`: it maps a function returning the D
+-- monad over a list, and only keeps the non-erroring return values.
+mapD :: (a -> D b) -> [a] -> D [b]
+mapD f xs =
+  let handler x = (f x >>= (\y-> return [y])) `catchError` (\_ -> return [])
+  in
+   concatMapM handler xs
 
 type NameSpaces = [(String, String)]
 
@@ -113,6 +119,10 @@ data Body = Body [BodyPart]
           deriving Show
 
 type Media = [(FilePath, B.ByteString)]
+
+type CharStyle = (String, RunStyle)
+
+type CharStyleMap = M.Map String RunStyle
 
 data Numbering = Numbering NameSpaces [Numb] [AbstractNumb]
                  deriving Show
@@ -128,6 +138,7 @@ type Level = (String, String, String, Maybe Integer)
 
 data Relationship = Relationship (RelId, Target)
                   deriving Show
+
 data Notes = Notes NameSpaces
              (Maybe (M.Map String Element))
              (Maybe (M.Map String Element))
@@ -140,19 +151,21 @@ data ParIndentation = ParIndentation { leftParIndent :: Maybe Integer
 
 data ParagraphStyle = ParagraphStyle { pStyle :: [String]
                                      , indentation :: Maybe ParIndentation
+                                     , dropCap     :: Bool
                                      }
                       deriving Show
 
 defaultParagraphStyle :: ParagraphStyle
 defaultParagraphStyle = ParagraphStyle { pStyle = []
                                        , indentation = Nothing
+                                       , dropCap     = False
                                        }
 
 
 data BodyPart = Paragraph ParagraphStyle [ParPart]
               | ListItem ParagraphStyle String String Level [ParPart]
               | Tbl String TblGrid TblLook [Row]
-              | OMathPara OMathParaStyle [OMath]
+              | OMathPara [Exp]
               deriving Show
 
 type TblGrid = [Integer]
@@ -176,107 +189,38 @@ data ParPart = PlainRun Run
              | InternalHyperLink Anchor [Run]
              | ExternalHyperLink URL [Run]
              | Drawing FilePath B.ByteString
-             | PlainOMath OMath
+             | PlainOMath [Exp]
              deriving Show
-
-data OMath = OMath [OMathElem]
-          deriving Show
-
-data OMathElem = Accent AccentStyle Base
-              | Bar BarStyle Base
-              | Box Base
-              | BorderBox Base
-              | Delimiter DelimStyle [Base]
-              | EquationArray [Base]
-              | Fraction [OMathElem] [OMathElem]
-              | Function [OMathElem] Base
-              | Group GroupStyle Base
-              | LowerLimit Base [OMathElem]
-              | UpperLimit Base [OMathElem]
-              | Matrix [[Base]]
-              | NAry NAryStyle [OMathElem] [OMathElem] Base
-              | Phantom Base
-              | Radical [OMathElem] Base
-              | PreSubSuper [OMathElem] [OMathElem] Base
-              | Sub Base [OMathElem]
-              | SubSuper Base [OMathElem] [OMathElem]
-              | Super Base [OMathElem]
-              | OMathRun OMathRunStyle Run
-              deriving Show
-
-data Base = Base [OMathElem]
-          deriving Show
-
--- placeholders
-type OMathParaStyle = [String]
-
-data TopBottom = Top | Bottom
-               deriving Show
-
-data AccentStyle = AccentStyle { accentChar :: Maybe Char }
-                 deriving Show
-
-data BarStyle = BarStyle { barPos :: TopBottom}
-              deriving Show
-
-data NAryStyle = NAryStyle { nAryChar :: Maybe Char
-                           , nAryLimLoc :: LimLoc}
-               deriving Show
-
-defaultNAryStyle :: NAryStyle
-defaultNAryStyle = NAryStyle { nAryChar = Nothing -- integral, in practice
-                             , nAryLimLoc = SubSup }
-
-data LimLoc = SubSup | UnderOver deriving Show
-
-data DelimStyle = DelimStyle { delimBegChar :: Maybe Char
-                             , delimSepChar :: Maybe Char
-                             , delimEndChar :: Maybe Char}
-                  deriving Show
-
-defaultDelimStyle :: DelimStyle
-defaultDelimStyle = DelimStyle { delimBegChar = Nothing
-                               , delimSepChar = Nothing
-                               , delimEndChar = Nothing }
-
-data GroupStyle = GroupStyle { groupChr :: Maybe Char
-                             , groupPos :: Maybe TopBottom }
-                  deriving Show
-
-defaultGroupStyle :: GroupStyle
-defaultGroupStyle = GroupStyle {groupChr = Nothing, groupPos = Nothing}
-
-type OMathRunStyle = [String]
-
 
 data Run = Run RunStyle [RunElem]
          | Footnote [BodyPart]
          | Endnote [BodyPart]
+         | InlineDrawing FilePath B.ByteString
            deriving Show
 
 data RunElem = TextRun String | LnBrk | Tab
              deriving Show
 
-data RunStyle = RunStyle { isBold :: Bool
-                         , isItalic :: Bool
-                         , isSmallCaps :: Bool
-                         , isStrike :: Bool
-                         , isSuperScript :: Bool
-                         , isSubScript :: Bool
+data VertAlign = BaseLn | SupScrpt | SubScrpt
+               deriving Show
+
+data RunStyle = RunStyle { isBold :: Maybe Bool
+                         , isItalic :: Maybe Bool
+                         , isSmallCaps :: Maybe Bool
+                         , isStrike :: Maybe Bool
+                         , rVertAlign :: Maybe VertAlign
                          , rUnderline :: Maybe String
-                         , rStyle :: Maybe String }
+                         , rStyle :: Maybe CharStyle}
                 deriving Show
 
 defaultRunStyle :: RunStyle
-defaultRunStyle = RunStyle { isBold = False
-                           , isItalic = False
-                           , isSmallCaps = False
-                           , isStrike = False
-                           , isSuperScript = False
-                           , isSubScript = False
+defaultRunStyle = RunStyle { isBold = Nothing
+                           , isItalic = Nothing
+                           , isSmallCaps = Nothing
+                           , isStrike = Nothing
+                           , rVertAlign = Nothing
                            , rUnderline = Nothing
-                           , rStyle = Nothing
-                           }
+                           , rStyle = Nothing}
 
 
 type Target = String
@@ -298,7 +242,8 @@ archiveToDocx archive = do
       numbering = archiveToNumbering archive
       rels      = archiveToRelationships archive
       media     = archiveToMedia archive
-      rEnv = ReaderEnv notes numbering rels media
+      styles    = archiveToStyles archive
+      rEnv = ReaderEnv notes numbering rels media Nothing styles
   doc <- runD (archiveToDocument archive) rEnv
   return $ Docx doc
 
@@ -317,6 +262,53 @@ elemToBody ns element | isElem ns "w" "body" element =
   mapD (elemToBodyPart ns) (elChildren element) >>=
   (\bps -> return $ Body bps)
 elemToBody _ _ = throwError WrongElem
+
+archiveToStyles :: Archive -> CharStyleMap
+archiveToStyles zf =
+  let stylesElem = findEntryByPath "word/styles.xml" zf >>=
+                   (parseXMLDoc . UTF8.toStringLazy . fromEntry)
+  in
+   case stylesElem of
+     Nothing -> M.empty
+     Just styElem ->
+       let namespaces = mapMaybe attrToNSPair (elAttribs styElem)
+       in
+        M.fromList $ buildBasedOnList namespaces styElem Nothing
+
+isBasedOnStyle :: NameSpaces -> Element -> Maybe CharStyle -> Bool
+isBasedOnStyle ns element parentStyle
+  | isElem ns "w" "style" element
+  , Just "character" <- findAttr (elemName ns "w" "type") element
+  , Just basedOnVal <- findChild (elemName ns "w" "basedOn") element >>=
+                       findAttr (elemName ns "w" "val")
+  , Just (parentId, _) <- parentStyle = (basedOnVal == parentId)
+  | isElem ns "w" "style" element
+  , Just "character" <- findAttr (elemName ns "w" "type") element
+  , Nothing <- findChild (elemName ns "w" "basedOn") element
+  , Nothing <- parentStyle = True
+  | otherwise = False
+
+elemToCharStyle :: NameSpaces -> Element -> Maybe CharStyle -> Maybe CharStyle
+elemToCharStyle ns element parentStyle
+  | isElem ns "w" "style" element
+  , Just "character" <- findAttr (elemName ns "w" "type") element
+  , Just styleId <- findAttr (elemName ns "w" "styleId") element =
+    Just (styleId, elemToRunStyle ns element parentStyle)
+  | otherwise = Nothing
+
+getStyleChildren :: NameSpaces -> Element -> Maybe CharStyle -> [CharStyle]
+getStyleChildren ns element parentStyle
+  | isElem ns "w" "styles" element =
+    mapMaybe (\e -> elemToCharStyle ns e parentStyle) $
+    filterChildren (\e' -> isBasedOnStyle ns e' parentStyle) element
+  | otherwise = []
+
+buildBasedOnList :: NameSpaces -> Element -> Maybe CharStyle -> [CharStyle]
+buildBasedOnList ns element rootStyle =
+  case (getStyleChildren ns element rootStyle) of
+    [] -> []
+    stys -> stys ++
+            (concatMap (\s -> buildBasedOnList ns element (Just s)) stys)
 
 archiveToNotes :: Archive -> Notes
 archiveToNotes zf =
@@ -546,9 +538,8 @@ elemToBodyPart ns element
   | isElem ns "w" "p" element
   , (c:_) <- findChildren (elemName ns "m" "oMathPara") element =
       do
-        let style = []  -- placeholder
-        maths <- mapD (elemToMath ns) (elChildren c)
-        return $ OMathPara style maths
+        expsLst <- eitherToD $ readOMML $ showElement c
+        return $ OMathPara expsLst
 elemToBodyPart ns element
   | isElem ns "w" "p" element
   , Just (numId, lvl) <- elemToNumInfo ns element = do
@@ -584,206 +575,19 @@ elemToBodyPart ns element
     return $ Tbl caption grid tblLook rows
 elemToBodyPart _ _ = throwError WrongElem
 
-elemToMath :: NameSpaces -> Element -> D OMath
-elemToMath ns element  | isElem ns "m" "oMath" element =
-    mapD (elemToMathElem ns) (elChildren element) >>=
-    (\es -> return $ OMath es)
-elemToMath _ _ = throwError WrongElem
-
-elemToBase :: NameSpaces -> Element -> D Base
-elemToBase ns element | isElem ns "m" "e" element =
-  mapD (elemToMathElem ns) (elChildren element) >>=
-  (\es -> return $ Base es)
-elemToBase _ _ = throwError WrongElem
-
-elemToNAryStyle :: NameSpaces -> Element -> NAryStyle
-elemToNAryStyle ns element
-  | Just narypr <- findChild (QName "naryPr" (lookup "m" ns) (Just "m")) element =
-  let
-    chr = findChild (QName "chr" (lookup "m" ns) (Just "m")) narypr >>=
-          findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-          Just . head
-    limLoc = findChild (QName "limLoc" (lookup "m" ns) (Just "m")) narypr >>=
-             findAttr (QName "val" (lookup "m" ns) (Just "m"))
-    limLoc' = case limLoc of
-      Just "undOver" -> UnderOver
-      Just "subSup"  -> SubSup
-      _              -> SubSup
-  in
-   NAryStyle { nAryChar = chr, nAryLimLoc = limLoc'}
-elemToNAryStyle _ _ = defaultNAryStyle
-
-elemToDelimStyle :: NameSpaces -> Element -> DelimStyle
-elemToDelimStyle ns element
-  | Just dPr <- findChild (QName "dPr" (lookup "m" ns) (Just "m")) element =
-    let begChr = findChild (QName "begChr" (lookup "m" ns) (Just "m")) dPr >>=
-                 findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-                 (\c -> if null c then Nothing else (Just $ head c))
-        sepChr = findChild (QName "sepChr" (lookup "m" ns) (Just "m")) dPr >>=
-                 findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-                 (\c -> if null c then Nothing else (Just $ head c))
-        endChr = findChild (QName "endChr" (lookup "m" ns) (Just "m")) dPr >>=
-                 findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-                 (\c -> if null c then Nothing else (Just $ head c))
-    in
-     DelimStyle { delimBegChar = begChr
-                , delimSepChar = sepChr
-                , delimEndChar = endChr}
-elemToDelimStyle _ _ = defaultDelimStyle
-
-elemToGroupStyle :: NameSpaces -> Element -> GroupStyle
-elemToGroupStyle ns element
-  | Just gPr <- findChild (QName "groupChrPr" (lookup "m" ns) (Just "m")) element =
-    let chr = findChild (QName "chr" (lookup "m" ns) (Just "m")) gPr >>=
-              findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-              Just . head
-        pos = findChild (QName "pos" (lookup "m" ns) (Just "m")) gPr >>=
-              findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-              (\s -> Just $ if s == "top" then Top else Bottom)
-    in
-     GroupStyle { groupChr = chr, groupPos = pos }
-elemToGroupStyle _ _ = defaultGroupStyle
-
-elemToMathElem :: NameSpaces -> Element -> D OMathElem
-elemToMathElem ns element | isElem ns "m" "acc" element = do
-  let accChar =
-        findChild (QName "accPr" (lookup "m" ns) (Just "m")) element >>=
-        findChild (QName "chr" (lookup "m" ns) (Just "m")) >>=
-        findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-        Just . head
-      accPr = AccentStyle { accentChar = accChar}
-  base <-(maybeToD $ findChild (elemName ns "m" "e") element) >>=
-         elemToBase ns
-  return $ Accent accPr base
-elemToMathElem ns element | isElem ns "m" "bar" element = do
-  barPr <- maybeToD $
-          findChild (QName "barPr" (lookup "m" ns) (Just "m")) element >>=
-          findChild (QName "pos" (lookup "m" ns) (Just "m")) >>=
-          findAttr (QName "val" (lookup "m" ns) (Just "m")) >>=
-          (\s ->
-            Just $ BarStyle {
-              barPos = (if s == "bot" then Bottom else Top)
-              })
-  base <-maybeToD (findChild (QName "e" (lookup "m" ns) (Just "m")) element) >>=
-         elemToBase ns
-  return $ Bar barPr base
-elemToMathElem ns element | isElem ns "m" "box" element =
-  maybeToD (findChild (elemName ns "m" "e") element) >>=
-  elemToBase ns >>=
-  (\b -> return $ Box b)
-elemToMathElem ns element | isElem ns "m" "borderBox" element =
-  maybeToD (findChild (elemName ns "m" "e") element) >>=
-  elemToBase ns >>=
-  (\b -> return $ BorderBox b)
-elemToMathElem ns element | isElem ns "m" "d" element =
-  let style = elemToDelimStyle ns element
-  in
-   mapD (elemToBase ns) (elChildren element) >>=
-   (\es -> return $ Delimiter style es)
-elemToMathElem ns element | isElem ns "m" "eqArr" element =
-  mapD (elemToBase ns) (elChildren element) >>=
-  (\es -> return $ EquationArray es)
-elemToMathElem ns element | isElem ns "m" "f" element = do
-  num <- maybeToD $ findChild (elemName ns "m" "num") element
-  den <- maybeToD $ findChild (elemName ns "m" "den") element
-  numElems <- mapD (elemToMathElem ns) (elChildren num)
-  denElems <- mapD (elemToMathElem ns) (elChildren den)
-  return $ Fraction numElems denElems
-elemToMathElem ns element | isElem ns "m" "func" element = do
-  fName <- maybeToD $ findChild (elemName ns "m" "fName") element
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  fnElems <- mapD (elemToMathElem ns) (elChildren fName)
-  return $ Function fnElems base
-elemToMathElem ns element | isElem ns "m" "groupChr" element =
-  let style = elemToGroupStyle ns element
-  in
-   maybeToD (findChild (elemName ns "m" "e") element) >>=
-   elemToBase ns >>=
-   (\b -> return $ Group style b)
-elemToMathElem ns element | isElem ns "m" "limLow" element = do
-  base <- maybeToD (findChild (elemName ns "m" "e") element)
-          >>= elemToBase ns
-  lim <- maybeToD $ findChild (elemName ns "m" "lim") element
-  limElems <- mapD (elemToMathElem ns) (elChildren lim)
-  return $ LowerLimit base limElems
-elemToMathElem ns element | isElem ns "m" "limUpp" element = do
-  base <- maybeToD (findChild (elemName ns "m" "e") element)
-          >>= elemToBase ns
-  lim <- maybeToD $ findChild (elemName ns "m" "lim") element
-  limElems <- mapD (elemToMathElem ns) (elChildren lim)
-  return $ UpperLimit base limElems
-elemToMathElem ns element | isElem ns "m" "m" element = do
-  let rows = findChildren (elemName ns "m" "mr") element
-  bases <- mapD (\mr -> mapD (elemToBase ns) (elChildren mr)) rows
-  return $ Matrix bases
-elemToMathElem ns element | isElem ns "m" "nary" element = do
-  let style = elemToNAryStyle ns element
-  sub <- maybeToD (findChild (elemName ns "m" "sub") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  sup <- maybeToD (findChild (elemName ns "m" "sup") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  return $ NAry style sub sup base
-elemToMathElem ns element | isElem ns "m" "rad" element = do
-  deg <- maybeToD (findChild (elemName ns "m" "deg") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  return $ Radical deg base
-elemToMathElem ns element | isElem ns "m" "phant" element = do
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  return $ Phantom base
-elemToMathElem ns element | isElem ns "m" "sPre" element = do
-  sub <- maybeToD (findChild (elemName ns "m" "sub") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  sup <- maybeToD (findChild (elemName ns "m" "sup") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  return $ PreSubSuper sub sup base
-elemToMathElem ns element | isElem ns "m" "sSub" element = do
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  sub <- maybeToD (findChild (elemName ns "m" "sub") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  return $ Sub base sub
-elemToMathElem ns element | isElem ns "m" "sSubSup" element = do
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  sub <- maybeToD (findChild (elemName ns "m" "sub") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  sup <- maybeToD (findChild (elemName ns "m" "sup") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  return $ SubSuper base sub sup
-elemToMathElem ns element | isElem ns "m" "sSup" element = do
-  base <- maybeToD (findChild (elemName ns "m" "e") element) >>=
-          elemToBase ns
-  sup <- maybeToD (findChild (elemName ns "m" "sup") element) >>=
-         (\e -> mapD (elemToMathElem ns) (elChildren e))
-  return $ Sub base sup
-elemToMathElem ns element | isElem ns "m" "r" element = do
-  let style = []            -- placeholder
-      rstyle = elemToRunStyle ns element
-  relems <- elemToRunElems ns element
-  return $ OMathRun style $ Run rstyle relems
-elemToMathElem _ _ = throwError WrongElem
-
 lookupRelationship :: RelId -> [Relationship] -> Maybe Target
 lookupRelationship relid rels =
   lookup relid (map (\(Relationship pair) -> pair) rels)
 
-expandDrawingId :: String -> D ParPart
+expandDrawingId :: String -> D (FilePath, B.ByteString)
 expandDrawingId s = do
   target <- asks (lookupRelationship s . envRelationships)
   case target of
-    Just t -> do let filepath = combine "word" t
-                 bytes <- asks (lookup filepath . envMedia)
-                 case bytes of
-                   Just bs -> return $ Drawing filepath bs
-                   Nothing -> throwError DocxError
+    Just filepath -> do
+      bytes <- asks (lookup ("word/" ++ filepath) . envMedia)
+      case bytes of
+        Just bs -> return (filepath, bs)
+        Nothing -> throwError DocxError
     Nothing -> throwError DocxError
 
 elemToParPart :: NameSpaces -> Element -> D ParPart
@@ -795,7 +599,7 @@ elemToParPart ns element
                   >>= findAttr (QName "embed" (lookup "r" ns) (Just "r"))
     in
      case drawing of
-       Just s -> expandDrawingId s
+       Just s -> expandDrawingId s >>= (\(fp, bs) -> return $ Drawing fp bs)
        Nothing -> throwError WrongElem
 elemToParPart ns element
   | isElem ns "w" "r" element =
@@ -832,6 +636,9 @@ elemToParPart ns element
     return $ case lookupRelationship relId rels of
       Just target -> ExternalHyperLink target runs
       Nothing     -> ExternalHyperLink "" runs
+elemToParPart ns element
+  | isElem ns "m" "oMath" element =
+    (eitherToD $ readOMML $ showElement element) >>= (return . PlainOMath)
 elemToParPart _ _ = throwError WrongElem
 
 lookupFootnote :: String -> Notes -> Maybe Element
@@ -841,6 +648,17 @@ lookupEndnote :: String -> Notes -> Maybe Element
 lookupEndnote s (Notes _ _ ens) = ens >>= (M.lookup s)
 
 elemToRun :: NameSpaces -> Element -> D Run
+elemToRun ns element
+  | isElem ns "w" "r" element
+  , Just drawingElem <- findChild (elemName ns "w" "drawing") element =
+    let a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        drawing = findElement (QName "blip" (Just a_ns) (Just "a")) drawingElem
+                  >>= findAttr (QName "embed" (lookup "r" ns) (Just "r"))
+    in
+     case drawing of
+       Just s -> expandDrawingId s >>=
+                 (\(fp, bs) -> return $ InlineDrawing fp bs)
+       Nothing -> throwError WrongElem
 elemToRun ns element
   | isElem ns "w" "r" element
   , Just ref <- findChild (elemName ns "w" "footnoteReference") element
@@ -857,12 +675,13 @@ elemToRun ns element
     notes <- asks envNotes
     case lookupEndnote enId notes of
       Just e -> do bps <- mapD (elemToBodyPart ns) (elChildren e)
-                   return $ Footnote bps
-      Nothing  -> return $ Footnote []
+                   return $ Endnote bps
+      Nothing  -> return $ Endnote []
 elemToRun ns element
   | isElem ns "w" "r" element = do
     runElems <- elemToRunElems ns element
-    return $ Run (elemToRunStyle ns element) runElems
+    runStyle <- elemToRunStyleD ns element
+    return $ Run runStyle runElems
 elemToRun _ _ = throwError WrongElem
 
 elemToParagraphStyle :: NameSpaces -> Element -> ParagraphStyle
@@ -874,57 +693,121 @@ elemToParagraphStyle ns element
           (findAttr (elemName ns "w" "val"))
           (findChildren (elemName ns "w" "pStyle") pPr)
       , indentation =
-            findChild (elemName ns "w" "ind") pPr >>=
-            elemToParIndentation ns
+          findChild (elemName ns "w" "ind") pPr >>=
+          elemToParIndentation ns
+      , dropCap =
+          case
+            findChild (elemName ns "w" "framePr") pPr >>=
+            findAttr (elemName ns "w" "dropCap")
+          of
+            Just "none" -> False
+            Just _      -> True
+            Nothing     -> False
       }
 elemToParagraphStyle _ _ =  defaultParagraphStyle
 
+checkOnOff :: NameSpaces -> Element -> QName -> Maybe Bool
+checkOnOff ns rPr tag
+  | Just t <-  findChild tag rPr
+  , Just val <- findAttr (elemName ns "w" "val") t =
+    Just $ case val of
+      "true"  -> True
+      "false" -> False
+      "on"    -> True
+      "off"   -> False
+      "1"     -> True
+      "0"     -> False
+      _       -> False
+  | Just _ <- findChild tag rPr = Just True
+checkOnOff _ _ _ = Nothing
 
-elemToRunStyle :: NameSpaces -> Element -> RunStyle
-elemToRunStyle ns element
+elemToRunStyleD :: NameSpaces -> Element -> D RunStyle
+elemToRunStyleD ns element
+  | Just rPr <- findChild (elemName ns "w" "rPr") element = do
+    charStyles <- asks envCharStyles
+    let parentSty = case
+          findChild (elemName ns "w" "rStyle") rPr >>=
+          findAttr (elemName ns "w" "val")
+          of
+            Just styName | Just style <- M.lookup styName charStyles ->
+              Just (styName, style)
+            _            -> Nothing
+    return $ elemToRunStyle ns element parentSty
+elemToRunStyleD _ _ = return defaultRunStyle
+
+elemToRunStyle :: NameSpaces -> Element -> Maybe CharStyle -> RunStyle
+elemToRunStyle ns element parentStyle
   | Just rPr <- findChild (elemName ns "w" "rPr") element =
     RunStyle
       {
-        isBold = isJust $ findChild (QName "b" (lookup "w" ns) (Just "w")) rPr
-      , isItalic = isJust $ findChild (QName "i" (lookup "w" ns) (Just "w")) rPr
-      , isSmallCaps = isJust $ findChild (QName "smallCaps" (lookup "w" ns) (Just "w")) rPr
-      , isStrike = isJust $ findChild (QName "strike" (lookup "w" ns) (Just "w")) rPr
-      , isSuperScript =
-        (Just "superscript" ==
-        (findChild (QName "vertAlign" (lookup "w" ns) (Just "w")) rPr >>=
-         findAttr (QName "val" (lookup "w" ns) (Just "w"))))
-      , isSubScript =
-        (Just "subscript" ==
-        (findChild (QName "vertAlign" (lookup "w" ns) (Just "w")) rPr >>=
-         findAttr (QName "val" (lookup "w" ns) (Just "w"))))
+        isBold = checkOnOff ns rPr (elemName ns "w" "b")
+      , isItalic = checkOnOff ns rPr (elemName ns "w" "i")
+      , isSmallCaps = checkOnOff ns rPr (elemName ns "w" "smallCaps")
+      , isStrike = checkOnOff ns rPr (elemName ns "w" "strike")
+      , rVertAlign =
+           findChild (elemName ns "w" "vertAlign") rPr >>=
+           findAttr (elemName ns "w" "val") >>=
+           \v -> Just $ case v of
+             "superscript" -> SupScrpt
+             "subscript"   -> SubScrpt
+             _             -> BaseLn
       , rUnderline =
-        findChild (QName "u" (lookup "w" ns) (Just "w")) rPr >>=
-        findAttr (QName "val" (lookup "w" ns) (Just "w"))
-      , rStyle =
-        findChild (QName "rStyle" (lookup "w" ns) (Just "w")) rPr >>=
-        findAttr (QName "val" (lookup "w" ns) (Just "w"))
+          findChild (elemName ns "w" "u") rPr >>=
+          findAttr (elemName ns "w" "val")
+      , rStyle = parentStyle
         }
-elemToRunStyle _ _ = defaultRunStyle
+elemToRunStyle _ _ _ = defaultRunStyle
 
 elemToRunElem :: NameSpaces -> Element -> D RunElem
 elemToRunElem ns element
-  | isElem ns "w" "t" element || isElem ns "w" "delText" element =
-    return $ TextRun $ strContent element
+  | isElem ns "w" "t" element
+    || isElem ns "w" "delText" element
+    || isElem ns "m" "t" element = do
+    let str = strContent element
+    font <- asks envFont
+    case font of
+      Nothing -> return $ TextRun str
+      Just f  -> return . TextRun $
+                  map (\x -> fromMaybe x . getUnicode f . lowerFromPrivate $ x) str
   | isElem ns "w" "br" element = return LnBrk
   | isElem ns "w" "tab" element = return Tab
+  | isElem ns "w" "sym" element = return (getSymChar ns element)
   | otherwise = throwError WrongElem
+  where
+    lowerFromPrivate (ord -> c)
+      | c >= ord '\xF000' = chr $ c - ord '\xF000'
+      | otherwise = chr c
+
+-- The char attribute is a hex string
+getSymChar :: NameSpaces -> Element -> RunElem
+getSymChar ns element
+  | Just s <- lowerFromPrivate <$> getCodepoint
+  , Just font <- getFont =
+  let [(char, _)] = readLitChar ("\\x" ++ s) in
+    TextRun . maybe "" (:[]) $ getUnicode font char
+  where
+    getCodepoint = findAttr (elemName ns "w" "char") element
+    getFont = stringToFont =<< findAttr (elemName ns "w" "font") element
+    lowerFromPrivate ('F':xs) = '0':xs
+    lowerFromPrivate xs = xs
+getSymChar _ _ = TextRun ""
+
+stringToFont :: String -> Maybe Font
+stringToFont "Symbol" = Just Symbol
+stringToFont _ = Nothing
 
 elemToRunElems :: NameSpaces -> Element -> D [RunElem]
 elemToRunElems ns element
-  |  isElem ns "w" "r" element = mapD (elemToRunElem ns) (elChildren element)
+  |  isElem ns "w" "r" element
+     || isElem ns "m" "r" element = do
+       let qualName = elemName ns "w"
+       let font = do
+                    fontElem <- findElement (qualName "rFonts") element
+                    stringToFont =<<
+                      (foldr (<|>) Nothing $
+                        map (flip findAttr fontElem . qualName) ["ascii", "hAnsi"])
+       local (setFont font) (mapD (elemToRunElem ns) (elChildren element))
 elemToRunElems _ _ = throwError WrongElem
 
-
-
-
-
-
-
-
-
-
+setFont :: Maybe Font -> ReaderEnv -> ReaderEnv
+setFont f s = s{envFont = f}

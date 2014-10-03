@@ -2,6 +2,7 @@
   FlexibleContexts
 , GeneralizedNewtypeDeriving
 , TypeSynonymInstances
+, MultiParamTypeClasses
 , FlexibleInstances #-}
 {-
 Copyright (C) 2006-2014 John MacFarlane <jgm@berkeley.edu>
@@ -64,6 +65,7 @@ module Text.Pandoc.Parsing ( anyLine,
                              widthsFromIndices,
                              gridTableWith,
                              readWith,
+                             readWithM,
                              testStringWith,
                              guardEnabled,
                              guardDisabled,
@@ -79,6 +81,7 @@ module Text.Pandoc.Parsing ( anyLine,
                              HeaderType (..),
                              ParserContext (..),
                              QuoteContext (..),
+                             HasQuoteContext (..),
                              NoteTable,
                              NoteTable',
                              KeyTable,
@@ -87,7 +90,6 @@ module Text.Pandoc.Parsing ( anyLine,
                              toKey,
                              registerHeader,
                              smartPunctuation,
-                             withQuoteContext,
                              singleQuoteStart,
                              singleQuoteEnd,
                              doubleQuoteStart,
@@ -105,8 +107,11 @@ module Text.Pandoc.Parsing ( anyLine,
                              runF,
                              askF,
                              asksF,
+                             token,
                              -- * Re-exports from Text.Pandoc.Parsec
+                             Stream,
                              runParser,
+                             runParserT,
                              parse,
                              anyToken,
                              getInput,
@@ -157,7 +162,6 @@ module Text.Pandoc.Parsing ( anyLine,
                              setSourceColumn,
                              setSourceLine,
                              newPos,
-                             token
                              )
 where
 
@@ -167,14 +171,15 @@ import Text.Pandoc.Builder (Blocks, Inlines, rawBlock, HasMeta(..))
 import qualified Text.Pandoc.Builder as B
 import Text.Pandoc.XML (fromEntities)
 import qualified Text.Pandoc.UTF8 as UTF8 (putStrLn)
-import Text.Parsec
+import Text.Parsec hiding (token)
 import Text.Parsec.Pos (newPos)
 import Data.Char ( toLower, toUpper, ord, chr, isAscii, isAlphaNum,
                    isHexDigit, isSpace )
 import Data.List ( intercalate, transpose )
 import Text.Pandoc.Shared
 import qualified Data.Map as M
-import Text.TeXMath.Macros (applyMacros, Macro, parseMacroDefinitions)
+import Text.TeXMath.Readers.TeX.Macros (applyMacros, Macro,
+                                        parseMacroDefinitions)
 import Text.Pandoc.Compat.TagSoupEntity ( lookupEntity )
 import Text.Pandoc.Asciify (toAsciiChar)
 import Data.Default
@@ -404,7 +409,7 @@ emailAddress = try $ toResult <$> mailbox <*> (char '@' *> domain)
 
 
 -- Schemes from http://www.iana.org/assignments/uri-schemes.html plus
--- the unofficial schemes coap, doi, javascript.
+-- the unofficial schemes coap, doi, javascript, isbn, pmid
 schemes :: [String]
 schemes = ["coap","doi","javascript","aaa","aaas","about","acap","cap","cid",
            "crid","data","dav","dict","dns","file","ftp","geo","go","gopher",
@@ -426,7 +431,7 @@ schemes = ["coap","doi","javascript","aaa","aaas","about","acap","cap","cid",
            "rtmp","secondlife","sftp","sgn","skype","smb","soldat","spotify",
            "ssh","steam","svn","teamspeak","things","udp","unreal","ut2004",
            "ventrilo","view-source","webcal","wtai","wyciwyg","xfire","xri",
-           "ymsgr"]
+           "ymsgr", "isbn", "pmid"]
 
 uriScheme :: Stream s m Char => ParserT s st m String
 uriScheme = oneOfStringsCI schemes
@@ -481,7 +486,8 @@ mathDisplayWith op cl = try $ do
   string op
   many1Till (noneOf "\n" <|> (newline <* notFollowedBy' blankline)) (try $ string cl)
 
-mathDisplay :: Stream s m Char => ParserT s ParserState m String
+mathDisplay :: (HasReaderOptions st, Stream s m Char)
+            => ParserT s st m String
 mathDisplay =
       (guardEnabled Ext_tex_math_dollars >> mathDisplayWith "$$" "$$")
   <|> (guardEnabled Ext_tex_math_single_backslash >>
@@ -489,7 +495,8 @@ mathDisplay =
   <|> (guardEnabled Ext_tex_math_double_backslash >>
        mathDisplayWith "\\\\[" "\\\\]")
 
-mathInline :: Stream s m Char => ParserT s ParserState m String
+mathInline :: (HasReaderOptions st , Stream s m Char)
+           => ParserT s st m String
 mathInline =
       (guardEnabled Ext_tex_math_dollars >> mathInlineWith "$" "$")
   <|> (guardEnabled Ext_tex_math_single_backslash >>
@@ -825,28 +832,36 @@ gridTableFooter = blanklines
 
 ---
 
--- | Parse a string with a given parser and state.
-readWith :: (Show s, Stream s Identity Char)
-         => ParserT s st Identity a       -- ^ parser
-         -> st                       -- ^ initial state
-         -> s                   -- ^ input
-         -> a
-readWith parser state input =
-    case runParser parser state "source" input of
-      Left err'    ->
+-- | Removes the ParsecT layer from the monad transformer stack
+readWithM :: (Monad m, Functor m)
+          => ParserT [Char] st m a       -- ^ parser
+          -> st                       -- ^ initial state
+          -> String                   -- ^ input
+          -> m a
+readWithM parser state input =
+    handleError <$> (runParserT parser state "source" input)
+    where
+      handleError (Left err') =
         let errPos = errorPos err'
             errLine = sourceLine errPos
             errColumn = sourceColumn errPos
-            theline = (lines (show input) ++ [""]) !! (errLine - 1)
+            theline = (lines input ++ [""]) !! (errLine - 1)
         in  error $ "\nError at " ++ show  err' ++ "\n" ++
                 theline ++ "\n" ++ replicate (errColumn - 1) ' ' ++
                 "^"
-      Right result -> result
+      handleError (Right result) = result
+
+-- | Parse a string with a given parser and state
+readWith :: Parser [Char] st a
+         -> st
+         -> String
+         -> a
+readWith p t inp = runIdentity $ readWithM p t inp
 
 -- | Parse a string with @parser@ (for testing).
-testStringWith :: (Show s, Show a, Stream s Identity Char)
-               => ParserT s ParserState Identity a
-               -> s
+testStringWith :: (Show a, Stream [Char] Identity Char)
+               => ParserT [Char] ParserState Identity a
+               -> [Char]
                -> IO ()
 testStringWith parser str = UTF8.putStrLn $ show $
                             readWith parser defaultParserState str
@@ -879,6 +894,7 @@ data ParserState = ParserState
       -- annotate role classes too).
       stateCaption         :: Maybe Inlines, -- ^ Caption in current environment
       stateInHtmlBlock     :: Maybe String,  -- ^ Tag type of HTML block being parsed
+      stateMarkdownAttribute :: Bool,        -- ^ True if in markdown=1 context
       stateWarnings        :: [String]       -- ^ Warnings generated by the parser
     }
 
@@ -896,6 +912,21 @@ class HasReaderOptions st where
   getOption            :: (Stream s m t) => (ReaderOptions -> b) -> ParserT s st m b
   -- default
   getOption  f         = (f . extractReaderOptions) <$> getState
+
+class HasQuoteContext st m where
+  getQuoteContext :: (Stream s m t) => ParsecT s st m QuoteContext
+  withQuoteContext :: QuoteContext -> ParsecT s st m a -> ParsecT s st m a
+
+instance Monad m => HasQuoteContext ParserState m where
+  getQuoteContext = stateQuoteContext <$> getState
+  withQuoteContext context parser = do
+    oldState <- getState
+    let oldQuoteContext = stateQuoteContext oldState
+    setState oldState { stateQuoteContext = context }
+    result <- parser
+    newState <- getState
+    setState newState { stateQuoteContext = oldQuoteContext }
+    return result
 
 instance HasReaderOptions ParserState where
   extractReaderOptions = stateOptions
@@ -958,6 +989,7 @@ defaultParserState =
                   stateRstCustomRoles  = M.empty,
                   stateCaption         = Nothing,
                   stateInHtmlBlock     = Nothing,
+                  stateMarkdownAttribute = False,
                   stateWarnings        = []}
 
 -- | Succeed only if the extension is enabled.
@@ -1038,9 +1070,9 @@ registerHeader (ident,classes,kvs) header' = do
 failUnlessSmart :: (Stream s m a, HasReaderOptions st) => ParserT s st m ()
 failUnlessSmart = getOption readerSmart >>= guard
 
-smartPunctuation :: Stream s m Char
-                 => ParserT s ParserState m Inlines
-                 -> ParserT s ParserState m Inlines
+smartPunctuation :: (HasReaderOptions st, HasLastStrPosition st, HasQuoteContext st m, Stream s m Char)
+                 => ParserT s st m Inlines
+                 -> ParserT s st m Inlines
 smartPunctuation inlineParser = do
   failUnlessSmart
   choice [ quoted inlineParser, apostrophe, dash, ellipses ]
@@ -1048,46 +1080,33 @@ smartPunctuation inlineParser = do
 apostrophe :: Stream s m Char => ParserT s st m Inlines
 apostrophe = (char '\'' <|> char '\8217') >> return (B.str "\x2019")
 
-quoted :: Stream s m Char
-       => ParserT s  ParserState m Inlines
-       -> ParserT s  ParserState m Inlines
+quoted :: (HasLastStrPosition st, HasQuoteContext st m, Stream s m Char)
+       => ParserT s st m Inlines
+       -> ParserT s st m Inlines
 quoted inlineParser = doubleQuoted inlineParser <|> singleQuoted inlineParser
 
-withQuoteContext :: Stream s m t
-                 => QuoteContext
-                 -> ParserT s ParserState m a
-                 -> ParserT s ParserState m a
-withQuoteContext context parser = do
-  oldState <- getState
-  let oldQuoteContext = stateQuoteContext oldState
-  setState oldState { stateQuoteContext = context }
-  result <- parser
-  newState <- getState
-  setState newState { stateQuoteContext = oldQuoteContext }
-  return result
-
-singleQuoted :: Stream s m Char
-             => ParserT s ParserState m Inlines
-             -> ParserT s ParserState m Inlines
+singleQuoted :: (HasLastStrPosition st, HasQuoteContext st m, Stream s m Char)
+             => ParserT s st m Inlines
+             -> ParserT s st m Inlines
 singleQuoted inlineParser = try $ do
   singleQuoteStart
   withQuoteContext InSingleQuote $ many1Till inlineParser singleQuoteEnd >>=
     return . B.singleQuoted . mconcat
 
-doubleQuoted :: Stream s m Char
-             => ParserT s ParserState m Inlines
-             -> ParserT s ParserState m Inlines
+doubleQuoted :: (HasQuoteContext st m, Stream s m Char)
+             => ParserT s st m Inlines
+             -> ParserT s st m Inlines
 doubleQuoted inlineParser = try $ do
   doubleQuoteStart
   withQuoteContext InDoubleQuote $ manyTill inlineParser doubleQuoteEnd >>=
     return . B.doubleQuoted . mconcat
 
-failIfInQuoteContext :: Stream s m t
+failIfInQuoteContext :: (HasQuoteContext st m, Stream s m t)
                      => QuoteContext
-                     -> ParserT s ParserState m ()
+                     -> ParserT s st m ()
 failIfInQuoteContext context = do
-  st <- getState
-  if stateQuoteContext st == context
+  context' <- getQuoteContext
+  if context' == context
      then fail "already inside quotes"
      else return ()
 
@@ -1097,8 +1116,8 @@ charOrRef cs =
                        guard (c `elem` cs)
                        return c)
 
-singleQuoteStart :: Stream s m Char
-                 => ParserT s ParserState m ()
+singleQuoteStart :: (HasLastStrPosition st, HasQuoteContext st m, Stream s m Char)
+                 => ParserT s st m ()
 singleQuoteStart = do
   failIfInQuoteContext InSingleQuote
   -- single quote start can't be right after str
@@ -1111,8 +1130,8 @@ singleQuoteEnd = try $ do
   charOrRef "'\8217\146"
   notFollowedBy alphaNum
 
-doubleQuoteStart :: Stream s m Char
-                 => ParserT s ParserState m ()
+doubleQuoteStart :: (HasQuoteContext st m, Stream s m Char)
+                 => ParserT s st m ()
 doubleQuoteStart = do
   failIfInQuoteContext InDoubleQuote
   try $ do charOrRef "\"\8220\147"
@@ -1166,6 +1185,14 @@ citeKey = try $ do
   let key = firstChar:rest
   return (suppress_author, key)
 
+
+token :: (Stream s m t)
+      => (t -> String)
+      -> (t -> SourcePos)
+      -> (t -> Maybe a)
+      -> ParsecT s st m a
+token pp pos match = tokenPrim pp (\_ t _ -> pos t) match
+
 --
 -- Macros
 --
@@ -1187,9 +1214,9 @@ macro = do
                            else return $ rawBlock "latex" def'
 
 -- | Apply current macros to string.
-applyMacros' :: Stream [Char] m Char
+applyMacros' :: (HasReaderOptions st, HasMacros st, Stream [Char] m Char)
              => String
-             -> ParserT [Char] ParserState m String
+             -> ParserT [Char] st m String
 applyMacros' target = do
   apply <- getOption readerApplyMacros
   if apply

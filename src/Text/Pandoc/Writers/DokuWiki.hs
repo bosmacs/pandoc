@@ -32,7 +32,7 @@ DokuWiki:  <https://www.dokuwiki.org/dokuwiki>
 
 {-
     [ ] Implement nested blockquotes (currently only ever does one level)
-    [ ] Implement alignment of text in tables
+    [x] Implement alignment of text in tables
     [ ] Implement comments
     [ ] Work through the Dokuwiki spec, and check I've not missed anything out
     [ ] Remove dud/duplicate code
@@ -40,35 +40,59 @@ DokuWiki:  <https://www.dokuwiki.org/dokuwiki>
 
 module Text.Pandoc.Writers.DokuWiki ( writeDokuWiki ) where
 import Text.Pandoc.Definition
-import Text.Pandoc.Options
-import Text.Pandoc.Shared
-import Text.Pandoc.Writers.Shared
-import Text.Pandoc.Templates (renderTemplate')
-import Data.List ( intersect, intercalate, isPrefixOf )
+import Text.Pandoc.Options ( WriterOptions(
+                                writerTableOfContents
+                              , writerStandalone
+                              , writerTemplate) )
+import Text.Pandoc.Shared ( escapeURI, removeFormatting, camelCaseToHyphenated
+                          , trimr, normalize, substitute  )
+import Text.Pandoc.Writers.Shared ( defField, metaToJSON )
+import Text.Pandoc.Templates ( renderTemplate' )
+import Data.List ( intersect, intercalate, isPrefixOf, transpose )
+import Data.Default (Default(..))
 import Network.URI ( isURI )
-import Control.Monad.State
+import Control.Monad ( zipWithM )
+import Control.Monad.State ( modify, State, get, evalState )
+import Control.Monad.Reader ( ReaderT, runReaderT, ask, local )
+import Control.Applicative ( (<$>) )
 
 data WriterState = WriterState {
     stNotes     :: Bool            -- True if there are notes
-  , stIndent    :: String          -- Indent after the marker at the beginning of list items
-  , stUseTags   :: Bool            -- True if we should use HTML tags because we're in a complex list
   }
+
+data WriterEnvironment = WriterEnvironment {
+    stIndent    :: String          -- Indent after the marker at the beginning of list items
+  , stUseTags   :: Bool            -- True if we should use HTML tags because we're in a complex list
+  , stBackSlashLB :: Bool     -- True if we should produce formatted strings with newlines (as in a table cell)
+  }
+
+instance Default WriterState where
+  def = WriterState { stNotes = False }
+
+instance Default WriterEnvironment where
+  def = WriterEnvironment { stIndent = ""
+                          , stUseTags = False
+                          , stBackSlashLB = False }
+
+type DokuWiki = ReaderT WriterEnvironment (State WriterState)
 
 -- | Convert Pandoc to DokuWiki.
 writeDokuWiki :: WriterOptions -> Pandoc -> String
 writeDokuWiki opts document =
-  evalState (pandocToDokuWiki opts $ normalize document)
-            (WriterState { stNotes = False, stIndent = "", stUseTags = False })
+  runDokuWiki (pandocToDokuWiki opts $ normalize document)
+
+runDokuWiki :: DokuWiki a -> a
+runDokuWiki = flip evalState def . flip runReaderT def
 
 -- | Return DokuWiki representation of document.
-pandocToDokuWiki :: WriterOptions -> Pandoc -> State WriterState String
+pandocToDokuWiki :: WriterOptions -> Pandoc -> DokuWiki String
 pandocToDokuWiki opts (Pandoc meta blocks) = do
   metadata <- metaToJSON opts
               (fmap trimr . blockListToDokuWiki opts)
               (inlineListToDokuWiki opts)
               meta
   body <- blockListToDokuWiki opts blocks
-  notesExist <- get >>= return . stNotes
+  notesExist <- stNotes <$> get
   let notes = if notesExist
                  then "" -- TODO Was "\n<references />" Check whether I can really remove this:
                          -- if it is definitely to do with footnotes, can remove this whole bit
@@ -90,7 +114,7 @@ escapeString = substitute "__" "%%__%%" .
 -- | Convert Pandoc block element to DokuWiki.
 blockToDokuWiki :: WriterOptions -- ^ Options
                 -> Block         -- ^ Block element
-                -> State WriterState String
+                -> DokuWiki String
 
 blockToDokuWiki _ Null = return ""
 
@@ -113,8 +137,8 @@ blockToDokuWiki opts (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
   return $ "{{:" ++ src ++ opt ++ "}}\n"
 
 blockToDokuWiki opts (Para inlines) = do
-  indent <- gets stIndent
-  useTags <- gets stUseTags
+  indent <- stIndent <$> ask
+  useTags <- stUseTags <$> ask
   contents <- inlineListToDokuWiki opts inlines
   return $ if useTags
               then "<HTML><p></HTML>" ++ contents ++ "<HTML></p></HTML>"
@@ -157,71 +181,82 @@ blockToDokuWiki opts (BlockQuote blocks) = do
      then return $ "> " ++ contents
      else return $ "<HTML><blockquote>\n" ++ contents ++ "</blockquote></HTML>"
 
-blockToDokuWiki opts (Table capt aligns _ headers rows') = do
-  let alignStrings = map alignmentToString aligns
+blockToDokuWiki opts (Table capt aligns _ headers rows) = do
   captionDoc <- if null capt
                    then return ""
                    else do
                       c <- inlineListToDokuWiki opts capt
                       return $ "" ++ c ++ "\n"
-  head' <- if all null headers
-              then return ""
-              else do
-                 hs <- tableHeaderToDokuWiki opts alignStrings 0 headers
-                 return $ hs ++ "\n"
-  body' <- zipWithM (tableRowToDokuWiki opts alignStrings) [1..] rows'
-  return $ captionDoc ++ head' ++
-            unlines body'
+  headers' <- if all null headers
+                 then return []
+                 else zipWithM (tableItemToDokuWiki opts) aligns headers
+  rows' <- mapM (zipWithM (tableItemToDokuWiki opts) aligns) rows
+  let widths = map (maximum . map length) $ transpose (headers':rows')
+  let padTo (width, al) s =
+          case (width - length s) of
+               x | x > 0 ->
+                 if al == AlignLeft || al == AlignDefault
+                    then s ++ replicate x ' '
+                    else if al == AlignRight
+                            then replicate x ' ' ++ s
+                            else replicate (x `div` 2) ' ' ++
+                                 s ++ replicate (x - x `div` 2) ' '
+                 | otherwise -> s
+  let renderRow sep cells = sep ++
+          intercalate sep (zipWith padTo (zip widths aligns) cells) ++ sep
+  return $ captionDoc ++
+           (if null headers' then "" else renderRow "^" headers' ++ "\n") ++
+           unlines (map (renderRow "|") rows')
 
 blockToDokuWiki opts x@(BulletList items) = do
-  oldUseTags <- get >>= return . stUseTags
-  indent <- get >>= return . stIndent
+  oldUseTags <- stUseTags <$> ask
+  indent <- stIndent <$> ask
+  backSlash <- stBackSlashLB <$> ask
   let useTags = oldUseTags || not (isSimpleList x)
   if useTags
      then do
-        modify $ \s -> s { stUseTags = True }
-        contents <- mapM (listItemToDokuWiki opts) items
-        modify $ \s -> s { stUseTags = oldUseTags }
+        contents <- local (\s -> s { stUseTags = True })
+                      (mapM (listItemToDokuWiki opts) items)
         return $ "<HTML><ul></HTML>\n" ++ vcat contents ++ "<HTML></ul></HTML>\n"
      else do
-        modify $ \s -> s { stIndent = stIndent s ++ "  " }
-        contents <- mapM (listItemToDokuWiki opts) items
-        modify $ \s -> s { stIndent = indent }
+        contents <- local (\s -> s { stIndent = stIndent s ++ "  "
+                                   , stBackSlashLB = backSlash})
+                      (mapM (listItemToDokuWiki opts) items)
         return $ vcat contents ++ if null indent then "\n" else ""
 
 blockToDokuWiki opts x@(OrderedList attribs items) = do
-  oldUseTags <- get >>= return . stUseTags
-  indent <- get >>= return . stIndent
+  oldUseTags <- stUseTags <$> ask
+  indent <- stIndent <$> ask
+  backSlash <- stBackSlashLB <$> ask
   let useTags = oldUseTags || not (isSimpleList x)
   if useTags
      then do
-        modify $ \s -> s { stUseTags = True }
-        contents <- mapM (orderedListItemToDokuWiki opts) items
-        modify $ \s -> s { stUseTags = oldUseTags }
+        contents <- local (\s -> s { stUseTags = True })
+                      (mapM (orderedListItemToDokuWiki opts) items)
         return $ "<HTML><ol" ++ listAttribsToString attribs ++ "></HTML>\n" ++ vcat contents ++ "<HTML></ol></HTML>\n"
      else do
-        modify $ \s -> s { stIndent = stIndent s ++ "  " }
-        contents <- mapM (orderedListItemToDokuWiki opts) items
-        modify $ \s -> s { stIndent = indent }
+        contents <- local (\s -> s { stIndent = stIndent s ++ "  "
+                                   , stBackSlashLB = backSlash})
+                      (mapM (orderedListItemToDokuWiki opts) items)
         return $ vcat contents ++ if null indent then "\n" else ""
 
 -- TODO Need to decide how to make definition lists work on dokuwiki - I don't think there
 --      is a specific representation of them.
 -- TODO This creates double '; ; ' if there is a bullet or ordered list inside a definition list
 blockToDokuWiki opts x@(DefinitionList items) = do
-  oldUseTags <- get >>= return . stUseTags
-  indent <- get >>= return . stIndent
+  oldUseTags <- stUseTags <$> ask
+  indent <- stIndent <$> ask
+  backSlash <- stBackSlashLB <$> ask
   let useTags = oldUseTags || not (isSimpleList x)
   if useTags
      then do
-        modify $ \s -> s { stUseTags = True }
-        contents <- mapM (definitionListItemToDokuWiki opts) items
-        modify $ \s -> s { stUseTags = oldUseTags }
+        contents <- local (\s -> s { stUseTags = True })
+                      (mapM (definitionListItemToDokuWiki opts) items)
         return $ "<HTML><dl></HTML>\n" ++ vcat contents ++ "<HTML></dl></HTML>\n"
      else do
-        modify $ \s -> s { stIndent = stIndent s ++ "  " }
-        contents <- mapM (definitionListItemToDokuWiki opts) items
-        modify $ \s -> s { stIndent = indent }
+        contents <- local (\s -> s { stIndent = stIndent s ++ "  "
+                                   , stBackSlashLB = backSlash})
+                      (mapM (definitionListItemToDokuWiki opts) items)
         return $ vcat contents ++ if null indent then "\n" else ""
 
 -- Auxiliary functions for lists:
@@ -238,42 +273,48 @@ listAttribsToString (startnum, numstyle, _) =
           else "")
 
 -- | Convert bullet list item (list of blocks) to DokuWiki.
-listItemToDokuWiki :: WriterOptions -> [Block] -> State WriterState String
+listItemToDokuWiki :: WriterOptions -> [Block] -> DokuWiki String
 listItemToDokuWiki opts items = do
   contents <- blockListToDokuWiki opts items
-  useTags <- get >>= return . stUseTags
+  useTags <- stUseTags <$> ask
   if useTags
      then return $ "<HTML><li></HTML>" ++ contents ++ "<HTML></li></HTML>"
      else do
-       indent <- get >>= return . stIndent
-       return $ indent ++ "* " ++ contents
+       indent <- stIndent <$> ask
+       backSlash <- stBackSlashLB <$> ask
+       let indent' = if backSlash then (drop 2 indent) else indent
+       return $ indent' ++ "* " ++ contents
 
 -- | Convert ordered list item (list of blocks) to DokuWiki.
 -- | TODO Emiminate dreadful duplication of text from listItemToDokuWiki
-orderedListItemToDokuWiki :: WriterOptions -> [Block] -> State WriterState String
+orderedListItemToDokuWiki :: WriterOptions -> [Block] -> DokuWiki String
 orderedListItemToDokuWiki opts items = do
   contents <- blockListToDokuWiki opts items
-  useTags <- get >>= return . stUseTags
+  useTags <- stUseTags <$> ask
   if useTags
      then return $ "<HTML><li></HTML>" ++ contents ++ "<HTML></li></HTML>"
      else do
-       indent <- get >>= return . stIndent
-       return $ indent ++ "- " ++ contents
+       indent <- stIndent <$> ask
+       backSlash <- stBackSlashLB <$> ask
+       let indent' = if backSlash then (drop 2 indent) else indent
+       return $ indent' ++ "- " ++ contents
 
 -- | Convert definition list item (label, list of blocks) to DokuWiki.
 definitionListItemToDokuWiki :: WriterOptions
                              -> ([Inline],[[Block]])
-                             -> State WriterState String
+                             -> DokuWiki String
 definitionListItemToDokuWiki opts (label, items) = do
   labelText <- inlineListToDokuWiki opts label
   contents <- mapM (blockListToDokuWiki opts) items
-  useTags <- get >>= return . stUseTags
+  useTags <- stUseTags <$> ask
   if useTags
      then return $ "<HTML><dt></HTML>" ++ labelText ++ "<HTML></dt></HTML>\n" ++
            (intercalate "\n" $ map (\d -> "<HTML><dd></HTML>" ++ d ++ "<HTML></dd></HTML>") contents)
      else do
-       indent <- get >>= return . stIndent
-       return $ indent ++ "* **" ++ labelText ++ "** " ++ concat contents
+       indent <- stIndent <$> ask
+       backSlash <- stBackSlashLB <$> ask
+       let indent' = if backSlash then (drop 2 indent) else indent
+       return $ indent' ++ "* **" ++ labelText ++ "** " ++ concat contents
 
 -- | True if the list can be handled by simple wiki markup, False if HTML tags will be needed.
 isSimpleList :: Block -> Bool
@@ -319,76 +360,50 @@ isSimpleBlockQuote _   = False
 vcat :: [String] -> String
 vcat = intercalate "\n"
 
+backSlashLineBreaks :: String -> String
+backSlashLineBreaks cs = reverse $ g $ reverse $ concatMap f cs
+  where f '\n' = "\\\\ "
+        f c    = [c]
+        g (' ' : '\\':'\\': xs) = xs
+        g s = s
+
 -- Auxiliary functions for tables:
 
--- TODO Eliminate copy-and-pasted code in tableHeaderToDokuWiki and tableRowToDokuWiki
-tableHeaderToDokuWiki :: WriterOptions
-                    -> [String]
-                    -> Int
-                    -> [[Block]]
-                    -> State WriterState String
-tableHeaderToDokuWiki opts alignStrings rownum cols' = do
-  let celltype = if rownum == 0 then "" else ""
-  cols'' <- sequence $ zipWith
-            (\alignment item -> tableItemToDokuWiki opts celltype alignment item)
-            alignStrings cols'
-  return $ "^ " ++ "" ++ joinHeaders cols'' ++ " ^"
-
-tableRowToDokuWiki :: WriterOptions
-                    -> [String]
-                    -> Int
-                    -> [[Block]]
-                    -> State WriterState String
-tableRowToDokuWiki opts alignStrings rownum cols' = do
-  let celltype = if rownum == 0 then "" else ""
-  cols'' <- sequence $ zipWith
-            (\alignment item -> tableItemToDokuWiki opts celltype alignment item)
-            alignStrings cols'
-  return $ "| " ++ "" ++ joinColumns cols'' ++ " |"
-
-alignmentToString :: Alignment -> [Char]
-alignmentToString alignment = case alignment of
-                                 AlignLeft    -> ""
-                                 AlignRight   -> ""
-                                 AlignCenter  -> ""
-                                 AlignDefault -> ""
-
 tableItemToDokuWiki :: WriterOptions
-                     -> String
-                     -> String
+                     -> Alignment
                      -> [Block]
-                     -> State WriterState String
--- TODO Fix celltype and align' defined but not used
-tableItemToDokuWiki opts _celltype _align' item = do
-  let mkcell x = "" ++ x ++ ""
-  contents <- blockListToDokuWiki opts item
+                     -> DokuWiki String
+tableItemToDokuWiki opts align' item = do
+  let mkcell x = (if align' == AlignRight || align' == AlignCenter
+                     then "  "
+                     else "") ++ x ++
+                 (if align' == AlignLeft || align' == AlignCenter
+                     then "  "
+                     else "")
+  contents <- local (\s -> s { stBackSlashLB = True }) $
+              blockListToDokuWiki opts item
   return $ mkcell contents
-
--- | Concatenates columns together.
-joinColumns :: [String] -> String
-joinColumns = intercalate " | "
-
--- | Concatenates headers together.
-joinHeaders :: [String] -> String
-joinHeaders = intercalate " ^ "
 
 -- | Convert list of Pandoc block elements to DokuWiki.
 blockListToDokuWiki :: WriterOptions -- ^ Options
                     -> [Block]       -- ^ List of block elements
-                    -> State WriterState String
-blockListToDokuWiki opts blocks =
-  mapM (blockToDokuWiki opts) blocks >>= return . vcat
+                    -> DokuWiki String
+blockListToDokuWiki opts blocks = do
+  backSlash <- stBackSlashLB <$> ask
+  if backSlash
+    then (backSlashLineBreaks . vcat) <$> mapM (blockToDokuWiki opts) blocks
+    else vcat <$> mapM (blockToDokuWiki opts) blocks
 
 -- | Convert list of Pandoc inline elements to DokuWiki.
-inlineListToDokuWiki :: WriterOptions -> [Inline] -> State WriterState String
-inlineListToDokuWiki opts lst = mapM (inlineToDokuWiki opts) lst >>= return . concat
+inlineListToDokuWiki :: WriterOptions -> [Inline] -> DokuWiki String
+inlineListToDokuWiki opts lst =
+  concat <$> (mapM (inlineToDokuWiki opts) lst)
 
 -- | Convert Pandoc inline element to DokuWiki.
-inlineToDokuWiki :: WriterOptions -> Inline -> State WriterState String
+inlineToDokuWiki :: WriterOptions -> Inline -> DokuWiki String
 
-inlineToDokuWiki opts (Span _attrs ils) = do
-  contents <- inlineListToDokuWiki opts ils
-  return contents
+inlineToDokuWiki opts (Span _attrs ils) =
+  inlineListToDokuWiki opts ils
 
 inlineToDokuWiki opts (Emph lst) = do
   contents <- inlineListToDokuWiki opts lst
@@ -461,11 +476,10 @@ inlineToDokuWiki opts (Link txt (src, _)) = do
                                      _      -> src -- link to a help page
 inlineToDokuWiki opts (Image alt (source, tit)) = do
   alt' <- inlineListToDokuWiki opts alt
-  let txt = if (null tit)
-               then if null alt
-                       then ""
-                       else "|" ++ alt'
-               else "|" ++ tit
+  let txt = case (tit, alt) of
+              ("", []) -> ""
+              ("", _ ) -> "|" ++ alt'
+              (_ , _ ) -> "|" ++ tit
   return $ "{{:" ++ source ++ txt ++ "}}"
 
 inlineToDokuWiki opts (Note contents) = do

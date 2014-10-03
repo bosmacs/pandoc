@@ -63,6 +63,7 @@ module Text.Pandoc
                , writers
                -- * Readers: converting /to/ Pandoc format
                , Reader (..)
+               , mkStringReader
                , readDocx
                , readMarkdown
                , readMediaWiki
@@ -76,6 +77,9 @@ module Text.Pandoc
                , readHaddock
                , readNative
                , readJSON
+               , readTxt2Tags
+               , readTxt2TagsNoMacros
+               , readEPUB
                -- * Writers: converting /from/ Pandoc format
                , Writer (..)
                , writeNative
@@ -130,6 +134,8 @@ import Text.Pandoc.Readers.Textile
 import Text.Pandoc.Readers.Native
 import Text.Pandoc.Readers.Haddock
 import Text.Pandoc.Readers.Docx
+import Text.Pandoc.Readers.Txt2Tags
+import Text.Pandoc.Readers.EPUB
 import Text.Pandoc.Writers.Native
 import Text.Pandoc.Writers.Markdown
 import Text.Pandoc.Writers.RST
@@ -157,6 +163,7 @@ import Text.Pandoc.Writers.Custom
 import Text.Pandoc.Templates
 import Text.Pandoc.Options
 import Text.Pandoc.Shared (safeRead, warn)
+import Text.Pandoc.MediaBag (MediaBag)
 import Data.Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.List (intercalate)
@@ -200,12 +207,12 @@ markdown o s = do
   return doc
 
 data Reader = StringReader (ReaderOptions -> String -> IO Pandoc)
-              | ByteStringReader (ReaderOptions -> BL.ByteString -> IO Pandoc)
+              | ByteStringReader (ReaderOptions -> BL.ByteString -> IO (Pandoc, MediaBag))
 
 mkStringReader :: (ReaderOptions -> String -> Pandoc) -> Reader
 mkStringReader r = StringReader (\o s -> return $ r o s)
 
-mkBSReader :: (ReaderOptions -> BL.ByteString -> Pandoc) -> Reader
+mkBSReader :: (ReaderOptions -> BL.ByteString -> (Pandoc, MediaBag)) -> Reader
 mkBSReader r = ByteStringReader (\o s -> return $ r o s)
 
 -- | Association list of formats and readers.
@@ -227,6 +234,8 @@ readers = [ ("native"       , StringReader $ \_ s -> return $ readNative s)
            ,("latex"        , mkStringReader readLaTeX)
            ,("haddock"      , mkStringReader readHaddock)
            ,("docx"         , mkBSReader readDocx)
+           ,("t2t"          , mkStringReader readTxt2TagsNoMacros)
+           ,("epub"         , mkBSReader readEPUB)
            ]
 
 data Writer = PureStringWriter   (WriterOptions -> Pandoc -> String)
@@ -295,7 +304,16 @@ getDefaultExtensions "markdown_github" = githubMarkdownExtensions
 getDefaultExtensions "markdown"        = pandocExtensions
 getDefaultExtensions "plain"           = pandocExtensions
 getDefaultExtensions "org"             = Set.fromList [Ext_citations]
-getDefaultExtensions "textile"         = Set.fromList [Ext_auto_identifiers, Ext_raw_tex]
+getDefaultExtensions "textile"         = Set.fromList [Ext_auto_identifiers]
+getDefaultExtensions "html"            = Set.fromList [Ext_auto_identifiers,
+                                                       Ext_native_divs,
+                                                       Ext_native_spans]
+getDefaultExtensions "html5"           = getDefaultExtensions "html"
+getDefaultExtensions "epub"            = Set.fromList [Ext_auto_identifiers,
+                                                       Ext_raw_html,
+                                                       Ext_native_divs,
+                                                       Ext_native_spans,
+                                                       Ext_epub_html_exts]
 getDefaultExtensions _                 = Set.fromList [Ext_auto_identifiers]
 
 -- | Retrieve reader based on formatSpec (format+extensions).

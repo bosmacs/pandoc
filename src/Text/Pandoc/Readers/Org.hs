@@ -37,14 +37,14 @@ import           Text.Pandoc.Options
 import qualified Text.Pandoc.Parsing as P
 import           Text.Pandoc.Parsing hiding ( F, unF, askF, asksF, runF
                                             , newline, orderedListMarker
-                                            , parseFromString
+                                            , parseFromString, blanklines
                                             )
 import           Text.Pandoc.Readers.LaTeX (inlineCommand, rawLaTeXInline)
 import           Text.Pandoc.Shared (compactify', compactify'DL)
-import           Text.TeXMath (texMathToPandoc, DisplayType(..))
+import           Text.TeXMath (readTeX, writePandoc, DisplayType(..))
 
 import           Control.Applicative ( Applicative, pure
-                                     , (<$>), (<$), (<*>), (<*), (*>), (<**>) )
+                                     , (<$>), (<$), (<*>), (<*), (*>) )
 import           Control.Arrow (first)
 import           Control.Monad (foldM, guard, liftM, liftM2, mplus, mzero, when)
 import           Control.Monad.Reader (Reader, runReader, ask, asks)
@@ -242,6 +242,13 @@ newline =
        <* updateLastPreCharPos
        <* updateLastForbiddenCharPos
 
+-- | Like @Text.Parsec.Char.blanklines@, but causes additional state changes.
+blanklines :: OrgParser [Char]
+blanklines =
+  P.blanklines
+       <* updateLastPreCharPos
+       <* updateLastForbiddenCharPos
+
 --
 -- parsing blocks
 --
@@ -274,7 +281,7 @@ optionalAttributes parser = try $
 parseBlockAttributes :: OrgParser ()
 parseBlockAttributes = do
   attrs <- many attribute
-  () <$ mapM (uncurry parseAndAddAttribute) attrs
+  mapM_ (uncurry parseAndAddAttribute) attrs
  where
    attribute :: OrgParser (String, String)
    attribute = try $ do
@@ -483,7 +490,7 @@ exampleCode :: String -> Blocks
 exampleCode = B.codeBlockWith ("", ["example"], [])
 
 exampleLine :: OrgParser String
-exampleLine = try $ string ": " *> anyLine
+exampleLine = try $ skipSpaces *> string ": " *> anyLine
 
 -- Drawers for properties or a logbook
 drawer :: OrgParser (F Blocks)
@@ -802,8 +809,12 @@ noteBlock = try $ do
 
 -- Paragraphs or Plain text
 paraOrPlain :: OrgParser (F Blocks)
-paraOrPlain = try $
-  parseInlines <**> (fmap <$> option B.plain (try $ newline *> pure B.para))
+paraOrPlain = try $ do
+  ils <- parseInlines
+  nl <- option False (newline >> return True)
+  try (guard nl >> notFollowedBy (orderedListStart <|> bulletListStart) >>
+           return (B.para <$> ils))
+    <|>  (return (B.plain <$> ils))
 
 inlinesTillNewline :: OrgParser (F Inlines)
 inlinesTillNewline = trimInlinesF . mconcat <$> manyTill inline newline
@@ -852,7 +863,7 @@ definitionListItem parseMarkerGetLength = try $ do
   line1 <- anyLineNewline
   blank <- option "" ("\n" <$ blankline)
   cont <- concat <$> many (listContinuation markerLength)
-  term' <- parseFromString inline term
+  term' <- parseFromString parseInlines term
   contents' <- parseFromString parseBlocks $ line1 ++ blank ++ cont
   return $ (,) <$> term' <*> fmap (:[]) contents'
 
@@ -1379,13 +1390,16 @@ inlineLaTeX = try $ do
   maybe mzero returnF $ parseAsMath cmd `mplus` parseAsInlineLaTeX cmd
  where
    parseAsMath :: String -> Maybe Inlines
-   parseAsMath cs = maybeRight $ B.fromList <$> texMathToPandoc DisplayInline cs
+   parseAsMath cs = B.fromList <$> texMathToPandoc cs
 
    parseAsInlineLaTeX :: String -> Maybe Inlines
    parseAsInlineLaTeX cs = maybeRight $ runParser inlineCommand state "" cs
 
    state :: ParserState
    state = def{ stateOptions = def{ readerParseRaw = True }}
+
+   texMathToPandoc inp = (maybeRight $ readTeX inp) >>=
+                         writePandoc DisplayInline
 
 maybeRight :: Either a b -> Maybe b
 maybeRight = either (const Nothing) Just
