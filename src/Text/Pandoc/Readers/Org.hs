@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses, FlexibleInstances #-}
 {-
 Copyright (C) 2014 Albert Krewinkel <tarleb@moltkeplatz.de>
 
@@ -96,6 +97,7 @@ data OrgParserState = OrgParserState
                       , orgStateMeta                 :: Meta
                       , orgStateMeta'                :: F Meta
                       , orgStateNotes'               :: OrgNoteTable
+                      , orgStateQuoteContext         :: QuoteContext  -- ^ Inside quoted environment? 
                       }
 
 instance HasReaderOptions OrgParserState where
@@ -110,6 +112,22 @@ instance HasMeta OrgParserState where
 instance HasLastStrPosition OrgParserState where
   getLastStrPos = orgStateLastStrPos
   setLastStrPos pos st = st{ orgStateLastStrPos = Just pos }
+
+--class HasQuoteContext st m where
+--  getQuoteContext :: (Stream s m t) => ParsecT s st m QuoteContext
+--  withQuoteContext :: QuoteContext -> ParsecT s st m a -> ParsecT s st m a
+
+instance Monad m => HasQuoteContext OrgParserState m where
+  getQuoteContext = orgStateQuoteContext <$> getState
+  withQuoteContext context parser = do
+    oldState <- getState
+    let oldQuoteContext = orgStateQuoteContext oldState
+    setState oldState { orgStateQuoteContext = context }
+    result <- parser
+    newState <- getState
+    setState newState { orgStateQuoteContext = oldQuoteContext }
+    return result
+
 
 instance Default OrgParserState where
   def = defaultOrgParserState
@@ -128,6 +146,7 @@ defaultOrgParserState = OrgParserState
                         , orgStateMeta = nullMeta
                         , orgStateMeta' = return nullMeta
                         , orgStateNotes' = []
+                        , orgStateQuoteContext = NoQuote
                         }
 
 recordAnchorId :: String -> OrgParser ()
@@ -918,6 +937,7 @@ inline =
          , subscript
          , superscript
          , inlineLaTeX
+         , smart
          , symbol
          ] <* (guard =<< newlinesCountWithinLimits)
   <?> "inline"
@@ -1413,3 +1433,29 @@ inlineLaTeXCommand = try $ do
       count len anyChar
       return cs
     _ -> mzero
+
+
+smart :: OrgParser (F Inlines)
+smart = do
+  getOption readerSmart >>= guard
+  doubleQuoted <|> singleQuoted <|>
+    choice (map (return <$>) [apostrophe, dash, ellipses])
+
+singleQuoted :: OrgParser (F Inlines)
+singleQuoted = try $ do
+  singleQuoteStart
+  withQuoteContext InSingleQuote $
+    fmap B.singleQuoted . trimInlinesF . mconcat <$>
+      many1Till inline singleQuoteEnd
+
+-- doubleQuoted will handle regular double-quoted sections, as well
+-- as dialogues with an open double-quote without a close double-quote
+-- in the same paragraph.
+doubleQuoted :: OrgParser (F Inlines)
+doubleQuoted = try $ do
+  doubleQuoteStart
+  contents <- mconcat <$> many (try $ notFollowedBy doubleQuoteEnd >> inline)
+  (withQuoteContext InDoubleQuote $ doubleQuoteEnd >> return
+       (fmap B.doubleQuoted . trimInlinesF $ contents))
+   <|> (return $ return (B.str "\8220") <> contents)
+
