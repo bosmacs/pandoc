@@ -1435,6 +1435,8 @@ smart = do
   getOption readerSmart >>= guard
   doubleQuoted <|> singleQuoted <|>
     choice (map (return <$>) [apostrophe, dash, ellipses])
+    <* updateLastPreCharPos
+    <* updateLastForbiddenCharPos
 
 singleQuoted :: OrgParser (F Inlines)
 singleQuoted = try $ do
