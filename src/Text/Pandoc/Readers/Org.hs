@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses, FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses, FlexibleContexts, FlexibleInstances #-}
 {-
 Copyright (C) 2014 Albert Krewinkel <tarleb@moltkeplatz.de>
 
@@ -49,7 +49,7 @@ import           Control.Applicative ( Applicative, pure
                                      , (<$>), (<$), (<*>), (<*), (*>) )
 import           Control.Arrow (first)
 import           Control.Monad (foldM, guard, liftM, liftM2, mplus, mzero, when)
-import           Control.Monad.Reader (Reader, runReader, ask, asks)
+import           Control.Monad.Reader (Reader, runReader, ask, asks, local)
 import           Data.Char (isAlphaNum, toLower)
 import           Data.Default
 import           Data.List (intersperse, isPrefixOf, isSuffixOf)
@@ -62,9 +62,11 @@ import           Network.HTTP (urlEncode)
 readOrg :: ReaderOptions -- ^ Reader options
         -> String        -- ^ String to parse (assuming @'\n'@ line endings)
         -> Pandoc
-readOrg opts s = readWith parseOrg def{ orgStateOptions = opts } (s ++ "\n\n")
+readOrg opts s = flip runReader def $ readWithM parseOrg def{ orgStateOptions = opts } (s ++ "\n\n")
 
-type OrgParser = Parser [Char] OrgParserState
+data OrgParserLocal = OrgParserLocal { orgLocalQuoteContext :: QuoteContext }
+
+type OrgParser = ParserT [Char] OrgParserState (Reader OrgParserLocal)
 
 parseOrg :: OrgParser Pandoc
 parseOrg = do
@@ -123,8 +125,10 @@ data OrgParserState = OrgParserState
                       , orgStateMeta                 :: Meta
                       , orgStateMeta'                :: F Meta
                       , orgStateNotes'               :: OrgNoteTable
-                      , orgStateQuoteContext         :: QuoteContext
                       }
+
+instance Default OrgParserLocal where
+  def = OrgParserLocal NoQuote
 
 instance HasReaderOptions OrgParserState where
   extractReaderOptions = orgStateOptions
@@ -139,16 +143,9 @@ instance HasLastStrPosition OrgParserState where
   getLastStrPos = orgStateLastStrPos
   setLastStrPos pos st = st{ orgStateLastStrPos = Just pos }
 
-instance Monad m => HasQuoteContext OrgParserState m where
-  getQuoteContext = orgStateQuoteContext <$> getState
-  withQuoteContext context parser = do
-    oldState <- getState
-    let oldQuoteContext = orgStateQuoteContext oldState
-    setState oldState { orgStateQuoteContext = context }
-    result <- parser
-    newState <- getState
-    setState newState { orgStateQuoteContext = oldQuoteContext }
-    return result
+instance HasQuoteContext st (Reader OrgParserLocal) where
+  getQuoteContext = asks orgLocalQuoteContext
+  withQuoteContext q = local (\s -> s{orgLocalQuoteContext = q})
 
 instance Default OrgParserState where
   def = defaultOrgParserState
@@ -167,7 +164,6 @@ defaultOrgParserState = OrgParserState
                         , orgStateMeta = nullMeta
                         , orgStateMeta' = return nullMeta
                         , orgStateNotes' = []
-                        , orgStateQuoteContext = NoQuote
                         }
 
 recordAnchorId :: String -> OrgParser ()
