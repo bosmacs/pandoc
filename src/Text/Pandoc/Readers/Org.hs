@@ -1280,12 +1280,16 @@ displayMath :: OrgParser (F Inlines)
 displayMath = return . B.displayMath <$> choice [ rawMathBetween "\\[" "\\]"
                                                 , rawMathBetween "$$"  "$$"
                                                 ]
-symbol :: OrgParser (F Inlines)
-symbol = return . B.str . (: "") <$> (oneOf specialChars >>= updatePositions)
- where updatePositions c = do
+
+updatePositions :: Char
+                -> OrgParser (Char)
+updatePositions c = do
          when (c `elem` emphasisPreChars) updateLastPreCharPos
          when (c `elem` emphasisForbiddenBorderChars) updateLastForbiddenCharPos
          return c
+
+symbol :: OrgParser (F Inlines)
+symbol = return . B.str . (: "") <$> (oneOf specialChars >>= updatePositions)
 
 emphasisBetween :: Char
                 -> OrgParser (F Inlines)
@@ -1503,8 +1507,7 @@ smart = do
   getOption readerSmart >>= guard
   doubleQuoted <|> singleQuoted <|>
     choice (map (return <$>) [apostrophe, dash, ellipses])
-    <* updateLastPreCharPos
-    <* updateLastForbiddenCharPos
+    <* (oneOf specialChars >>= updatePositions) -- this breaks several smart punctation test cases
 
 singleQuoted :: OrgParser (F Inlines)
 singleQuoted = try $ do
