@@ -1284,9 +1284,9 @@ displayMath = return . B.displayMath <$> choice [ rawMathBetween "\\[" "\\]"
 updatePositions :: Char
                 -> OrgParser (Char)
 updatePositions c = do
-         when (c `elem` emphasisPreChars) updateLastPreCharPos
-         when (c `elem` emphasisForbiddenBorderChars) updateLastForbiddenCharPos
-         return c
+  when (c `elem` emphasisPreChars) updateLastPreCharPos
+  when (c `elem` emphasisForbiddenBorderChars) updateLastForbiddenCharPos
+  return c
 
 symbol :: OrgParser (F Inlines)
 symbol = return . B.str . (: "") <$> (oneOf specialChars >>= updatePositions)
@@ -1501,13 +1501,15 @@ inlineLaTeXCommand = try $ do
       return cs
     _ -> mzero
 
-
 smart :: OrgParser (F Inlines)
 smart = do
   getOption readerSmart >>= guard
   doubleQuoted <|> singleQuoted <|>
-    choice (map (return <$>) [apostrophe, dash, ellipses])
-    <* (oneOf specialChars >>= updatePositions) -- this breaks several smart punctation test cases
+    choice (map (return <$>) [orgApostrophe, dash, ellipses])
+  where orgApostrophe =
+          (char '\'' <|> char '\8217') <* updateLastPreCharPos
+                                       <* updateLastForbiddenCharPos
+                                       *> return (B.str "\x2019")
 
 singleQuoted :: OrgParser (F Inlines)
 singleQuoted = try $ do
@@ -1523,7 +1525,6 @@ doubleQuoted :: OrgParser (F Inlines)
 doubleQuoted = try $ do
   doubleQuoteStart
   contents <- mconcat <$> many (try $ notFollowedBy doubleQuoteEnd >> inline)
-  (withQuoteContext InDoubleQuote $ doubleQuoteEnd >> return
+  (withQuoteContext InDoubleQuote $ (doubleQuoteEnd <* updateLastForbiddenCharPos) >> return
        (fmap B.doubleQuoted . trimInlinesF $ contents))
    <|> (return $ return (B.str "\8220") <> contents)
-
